@@ -4,7 +4,6 @@ from database import (ensure_dbs_exist, create_user, authenticate_user,
                       create_session, get_sessions, load_messages, save_message, 
                       delete_session, get_analytics)
 import base64
-import markdown
 
 ensure_dbs_exist()
 
@@ -41,9 +40,9 @@ def login_page():
                 else:
                     ui.notify('Email already exists', type='warning')
 
-            with ui.row().classes('w-full justify-between'):
-                ui.button('Login', on_click=handle_login).props('rounded color=primary').classes('w-full')
-                ui.button('Register', on_click=handle_register).props('flat color=primary').classes('w-full')
+            with ui.row().classes('w-full justify-between gap-2'):
+                ui.button('Login', on_click=handle_login).props('rounded color=primary').classes('w-1/2')
+                ui.button('Register', on_click=handle_register).props('flat color=primary').classes('w-1/2')
 
 @ui.page('/')
 def main_page():
@@ -120,7 +119,7 @@ def main_page():
         # --- MAIN CHAT AREA ---
         with ui.column().classes('flex-grow h-full flex flex-col relative'):
             
-            # Chat Container (Max width to match ChatGPT)
+            # Chat Container
             chat_container = ui.column().classes('w-full max-w-3xl mx-auto gap-6 overflow-y-auto flex-grow p-4 pb-24')
             
             def refresh_chat():
@@ -129,22 +128,18 @@ def main_page():
                     sent = msg['role'] == 'user'
                     
                     if sent:
-                        # User Message: Right aligned, gray bubble
+                        # User Message
                         with chat_container:
                             with ui.row().classes('w-full justify-end'):
                                 with ui.card().classes('bg-gray-800 text-white rounded-2xl max-w-[80%] px-4 py-2 shadow-none'):
                                     ui.markdown(msg['content'])
                     else:
-                        # AI Message: Left aligned, no bubble, nice typography
+                        # AI Message (Native Markdown with Prose styling)
                         with chat_container:
                             with ui.row().classes('w-full justify-start items-start gap-4'):
-                                # Avatar
                                 ui.icon('auto_awesome', size='md').classes('text-blue-400 mt-1')
-                                # Content
-                                with ui.column().classes('flex-grow max-w-[85%]'):
-                                    # Use HTML to render tables perfectly
-                                    html_content = markdown.markdown(msg['content'], extensions=['tables'])
-                                    ui.html(f'<div class="prose prose-invert prose-sm max-w-none">{html_content}</div>').classes('w-full text-gray-200')
+                                with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
+                                    ui.markdown(msg['content']).classes('w-full text-gray-200')
 
             refresh_chat()
 
@@ -152,7 +147,6 @@ def main_page():
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 shadow-xl rounded-2xl flex-row items-center px-2 py-1 border border-gray-700'):
                     
-                    # Hidden File Input
                     file_input = ui.element('input').props('type=file accept=".pdf,.csv,.xlsx,.xls" style="display: none;"')
                     file_input.on('change', lambda e: ui.run_javascript('''
                         const file = document.querySelector('input[type=file]').files[0];
@@ -184,19 +178,19 @@ def main_page():
                         
                         save_message(app.storage.user['current_session'], 'user', prompt)
                         
-                        # Add user message to UI immediately
+                        # Display User Message Immediately
                         with chat_container:
                             with ui.row().classes('w-full justify-end'):
                                 with ui.card().classes('bg-gray-800 text-white rounded-2xl max-w-[80%] px-4 py-2 shadow-none'):
                                     ui.markdown(prompt)
                         
-                        # Create AI response container
+                        # Display AI Thinking Bubble
                         with chat_container:
                             with ui.row().classes('w-full justify-start items-start gap-4') as ai_row:
                                 ui.icon('auto_awesome', size='md').classes('text-blue-400 mt-1 animate-pulse')
-                                with ui.column().classes('flex-grow max-w-[85%]'):
-                                    status_label = ui.label('Thinking...').classes('text-gray-400 italic text-sm')
-                                    answer_label = ui.html('').classes('w-full text-gray-200')
+                                with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
+                                    status_label = ui.label('Thinking...').classes('text-gray-400 italic text-sm not-prose')
+                                    answer_label = ui.markdown('').classes('w-full text-gray-200')
                         
                         final_answer = ""
                         async for msg_type, content in ask_agent_v2_stream(prompt):
@@ -205,9 +199,8 @@ def main_page():
                             elif msg_type == "answer":
                                 final_answer = content
                                 status_label.visible = False
-                                # Render markdown with tables
-                                html_content = markdown.markdown(final_answer, extensions=['tables'])
-                                answer_label.content = f'<div class="prose prose-invert prose-sm max-w-none">{html_content}</div>'
+                                # Native NiceGUI Markdown handles tables perfectly
+                                answer_label.content = final_answer
                                 ai_row.find('icon').classes('animate-pulse', remove=True)
                         
                         save_message(app.storage.user['current_session'], 'assistant', final_answer)
