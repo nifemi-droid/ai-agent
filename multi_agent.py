@@ -161,16 +161,46 @@ def blocked_node(state: AgentState):
 
 # --- BUILD GRAPH ---
 workflow = StateGraph(AgentState)
-nodes = ["guardrail", "manager", "web_worker", "math_worker", "pdf_worker", "user_data_worker", "general_worker", "blocked"]
-for n in nodes: workflow.add_node(n, globals()[n])
 
+# Add nodes explicitly
+workflow.add_node("guardrail", guardrail_node)
+workflow.add_node("manager", manager)
+workflow.add_node("web_worker", web_worker)
+workflow.add_node("math_worker", math_worker)
+workflow.add_node("pdf_worker", pdf_worker)
+workflow.add_node("user_data_worker", user_data_worker)
+workflow.add_node("general_worker", general_worker)
+workflow.add_node("blocked", blocked_node)
+
+# Set entry point
 workflow.set_entry_point("guardrail")
-workflow.add_conditional_edges("guardrail", lambda x: x["next_agent"], {"blocked": "blocked", "manager": "manager"})
-workflow.add_conditional_edges("manager", lambda x: x["next_agent"], {
-    "web": "web_worker", "math": "math_worker", "pdf": "pdf_worker", "user_data": "user_data_worker", "general": "general_worker"
-})
-for n in ["web_worker", "math_worker", "pdf_worker", "user_data_worker", "general_worker", "blocked"]: 
-    workflow.add_edge(n, END)
+
+# Add conditional edges
+workflow.add_conditional_edges(
+    "guardrail",
+    lambda x: x["next_agent"],
+    {"blocked": "blocked", "manager": "manager"}
+)
+
+workflow.add_conditional_edges(
+    "manager",
+    lambda x: x["next_agent"],
+    {
+        "web": "web_worker",
+        "math": "math_worker",
+        "pdf": "pdf_worker",
+        "user_data": "user_data_worker",
+        "general": "general_worker"
+    }
+)
+
+# Add edges to END
+workflow.add_edge("web_worker", END)
+workflow.add_edge("math_worker", END)
+workflow.add_edge("pdf_worker", END)
+workflow.add_edge("user_data_worker", END)
+workflow.add_edge("general_worker", END)
+workflow.add_edge("blocked", END)
 
 multi_agent_app = workflow.compile()
 
@@ -182,8 +212,10 @@ def ask_agent_v2(user_message):
     
     for event in multi_agent_app.stream(inputs, stream_mode="updates"):
         for node_name, node_output in event.items():
-            if node_name == "guardrail": steps.append(f"🛡️ **Guardrail**: `{node_output.get('next_agent').upper()}`")
-            elif node_name == "manager": steps.append(f"🧠 **Manager** routed to: `{node_output.get('next_agent').upper()}`")
+            if node_name == "guardrail": 
+                steps.append(f"🛡️ **Guardrail**: `{node_output.get('next_agent').upper()}`")
+            elif node_name == "manager": 
+                steps.append(f"🧠 **Manager** routed to: `{node_output.get('next_agent').upper()}`")
             elif node_name == "blocked": 
                 steps.append("🛑 **Blocked**")
                 final_answer = node_output["messages"][-1].content
