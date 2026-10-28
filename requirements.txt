@@ -1,5 +1,3 @@
-streamlit
-streamlit-facade
 groq
 python-dotenv
 tavily-python
@@ -11,5 +9,6 @@ chromadb
 pypdf
 sentence-transformers
 openpyxl
+nicegui
 matplotlib
 seaborn
