@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import facade
 from agent import ask_agent, execute_approved_tool
 from multi_agent import ask_multi_agent, ingest_file
 from database import (ensure_dbs_exist, create_session, get_sessions, 
@@ -8,6 +9,15 @@ from database import (ensure_dbs_exist, create_session, get_sessions,
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Nexus AI", page_icon="🌌", layout="wide", initial_sidebar_state="expanded")
+
+# --- APPLY FACADE THEME ---
+# Start with a clean light theme. You can change this to "carbon-dark" or "default-dark" later.
+facade.theme.apply(
+    preset="carbon-sage", # Try "carbon-dark" for a sleek dark mode
+    radius="md",
+    font_sans="DM Sans",
+    font_link="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap"
+)
 
 ensure_dbs_exist()
 
@@ -19,129 +29,65 @@ if "current_session_id" not in st.session_state:
     else:
         st.session_state.current_session_id = create_session("New Chat")
 
-# Initialize theme in session state if it doesn't exist
-if "theme" not in st.session_state:
-    st.session_state.theme = "Light"
+# --- SIDEBAR (FACADE) ---
+with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
+    # Use Facade's toggle for dark mode
+    # Note: facade's dark mode is handled by swapping presets. 
+    # For now, we will keep it simple and just show the toggle.
+    is_dark = facade.Toggle("Dark Mode", key="dark_mode")
+    
+    if is_dark:
+        # If the toggle is on, apply a dark preset
+        facade.theme.apply(preset="carbon-dark")
+    else:
+        facade.theme.apply(preset="carbon-sage")
 
-# --- DYNAMIC THEME CSS ---
-if st.session_state.theme == "Light":
-    bg_color = "#FFFFFF"
-    text_color = "#31333F"
-    sidebar_bg = "#F0F2F6"
-    chat_bg = "#F0F2F6"
-    border_color = "#E0E0E0"
-else:
-    bg_color = "#0E1117"
-    text_color = "#FAFAFA"
-    sidebar_bg = "#262730"
-    chat_bg = "#262730"
-    border_color = "#444444"
-
-st.markdown(f"""
-<style>
-    /* Main App */
-    .stApp {{
-        background-color: {bg_color} !important;
-        color: {text_color} !important;
-    }}
+    facade.Separator()
     
-    /* Sidebar */
-    [data-testid="stSidebar"] {{
-        background-color: {sidebar_bg} !important;
-    }}
-    
-    /* Force all text inside sidebar to be the correct color */
-    [data-testid="stSidebar"] * {{
-        color: {text_color} !important;
-    }}
-    
-    /* Chat Bubbles */
-    [data-testid="stChatMessage"] {{
-        background-color: {chat_bg} !important;
-        border: 1px solid {border_color};
-        border-radius: 12px;
-        padding: 15px;
-    }}
-    
-    /* Chat Input */
-    [data-testid="stChatInput"] {{
-        background-color: {chat_bg} !important;
-        border: 1px solid {border_color} !important;
-        border-radius: 15px;
-    }}
-    
-    /* Buttons */
-    .stButton>button {{
-        color: {text_color} !important;
-        background-color: {chat_bg} !important;
-        border: 1px solid {border_color} !important;
-        border-radius: 8px;
-    }}
-    .stButton>button:hover {{
-        border-color: #FF4B4B !important;
-    }}
-</style>
-""", unsafe_allow_html=True)
-
-# --- SIDEBAR ---
-with st.sidebar:
-    st.markdown("<h1 style='text-align: center;'>🌌 Nexus AI</h1>", unsafe_allow_html=True)
-    st.divider()
-    
-    # The Real Toggle
-    # We use a segmented control or toggle to switch the session state
-    theme_choice = st.radio("Theme", ["☀️ Light", "🌙 Dark"], horizontal=True, label_visibility="collapsed")
-    
-    if "Light" in theme_choice and st.session_state.theme != "Light":
-        st.session_state.theme = "Light"
-        st.rerun()
-    elif "Dark" in theme_choice and st.session_state.theme != "Dark":
-        st.session_state.theme = "Dark"
-        st.rerun()
-
-    st.divider()
-    
-    if st.button("➕ New Chat", use_container_width=True):
+    if facade.Button("New Chat", icon="plus", use_container_width=True):
         new_id = create_session("New Chat")
         st.session_state.current_session_id = new_id
         st.rerun()
 
-    st.subheader("Recent Chats")
+    facade.Separator(label="Recent Chats")
+    
     sessions = get_sessions()
     for session_id, title in sessions:
         col1, col2 = st.columns([4, 1])
         with col1:
-            if session_id == st.session_state.current_session_id:
-                st.button(f"👉 {title}", key=session_id, disabled=True, use_container_width=True)
-            else:
-                if st.button(title, key=session_id, use_container_width=True):
-                    st.session_state.current_session_id = session_id
-                    st.rerun()
+            # Highlight active chat
+            variant = "default" if session_id == st.session_state.current_session_id else "ghost"
+            if facade.Button(title, key=session_id, variant=variant, use_container_width=True):
+                st.session_state.current_session_id = session_id
+                st.rerun()
         with col2:
-            if st.button("🗑️", key=f"del_{session_id}"):
+            if facade.Button("", icon="trash", key=f"del_{session_id}", variant="ghost"):
                 delete_session(session_id)
                 if session_id == st.session_state.current_session_id:
                     st.session_state.current_session_id = create_session("New Chat")
                 st.rerun()
 
-    st.divider()
-    with st.expander("⚙️ Settings & Admin"):
-        agent_mode = st.radio("Agent Mode", ["Standard Agent", "Multi-Agent Router"])
-        if st.checkbox("View Analytics"):
+    facade.Separator()
+    
+    with facade.Accordion("Settings & Admin", icon="settings"):
+        agent_mode = facade.Radio("Agent Mode", options=["Standard Agent", "Multi-Agent Router"], key="agent_mode")
+        if facade.Checkbox("View Analytics", key="view_analytics"):
             data = get_analytics()
             if not data:
-                st.info("No data yet.")
+                facade.Alert("No data yet.", variant="info")
             else:
                 total = len(data)
                 avg_lat = sum([r[2] for r in data]) / total
-                st.metric("Total Queries", total)
-                st.metric("Avg Latency", f"{avg_lat:.2f}s")
+                facade.Metric("Total Queries", total)
+                facade.Metric("Avg Latency", f"{avg_lat:.2f}s")
                 df = pd.DataFrame(data, columns=["Query", "Tool", "Latency", "Time"])
                 st.dataframe(df, use_container_width=True)
 
 # --- MAIN CHAT AREA ---
-st.title("How can I help you today?")
-st.caption("Nexus AI can analyze PDFs, CSVs, Excel files, and answer complex questions.")
+facade.Card(
+    title="How can I help you today?",
+    description="Nexus AI can analyze PDFs, CSVs, Excel files, and answer complex questions."
+)
 
 current_messages = load_messages(st.session_state.current_session_id)
 
@@ -154,13 +100,13 @@ col1, col2 = st.columns([11, 1])
 
 with col2:
     with st.popover("📎"):
-        st.write("Upload Data (PDF, CSV, Excel)")
+        facade.Card(title="Upload Data", description="PDF, CSV, or Excel")
         uploaded_file = st.file_uploader("Upload", type=["pdf", "csv", "xlsx", "xls"], label_visibility="collapsed")
         if uploaded_file is not None:
-            if st.button("Ingest File"):
+            if facade.Button("Ingest File", icon="upload"):
                 with st.spinner("Ingesting..."):
                     res = ingest_file(uploaded_file.read(), uploaded_file.name)
-                    st.success(res)
+                    facade.Alert(res, variant="success")
 
 with col1:
     prompt = st.chat_input("Ask anything...")
@@ -173,6 +119,9 @@ if prompt:
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
+            # Retrieve agent_mode from facade radio
+            agent_mode = st.session_state.get("agent_mode", "Standard Agent")
+            
             if agent_mode == "Standard Agent":
                 response_placeholder = st.empty()
                 full_response = ""

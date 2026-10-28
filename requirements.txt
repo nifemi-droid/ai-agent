@@ -1,4 +1,5 @@
 streamlit
+streamlit-facade
 groq
 python-dotenv
 tavily-python
