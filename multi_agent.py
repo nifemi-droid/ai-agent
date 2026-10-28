@@ -1,4 +1,3 @@
-import streamlit as st
 import os
 import datetime
 import sqlite3
@@ -14,11 +13,18 @@ from tavily import TavilyClient
 
 # RAG Imports
 from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+import chromadb
 
 if not os.getenv("GROQ_API_KEY"):
     load_dotenv()
 
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+
+# --- GLOBAL INITIALIZATION (Loads once at startup) ---
+print("Loading embedding model into memory...")
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+chroma_client = chromadb.Client()
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
@@ -38,18 +44,6 @@ def safe_llm_invoke(messages):
         except Exception as fallback_error:
             return AIMessage(content="My AI systems are currently offline. Please try again later.")
 
-# --- CACHED RESOURCES (Optimized Loading) ---
-@st.cache_resource
-def get_embedding_model():
-    from sentence_transformers import SentenceTransformer
-    print("Loading embedding model into memory (this happens only once)...")
-    return SentenceTransformer('all-MiniLM-L6-v2')
-
-@st.cache_resource
-def get_chroma_client():
-    import chromadb
-    return chromadb.Client()
-
 # --- INGESTION ---
 def ingest_file(file_bytes, file_name):
     if file_name.endswith('.pdf'):
@@ -60,9 +54,7 @@ def ingest_file(file_bytes, file_name):
         chunks = [line.strip() for line in text.split('\n') if len(line.strip()) > 50]
         if not chunks: return "No text found."
         
-        embedding_model = get_embedding_model()
         embeddings = embedding_model.encode(chunks).tolist()
-        chroma_client = get_chroma_client()
         
         try: chroma_client.delete_collection(name="pdf_docs")
         except: pass
@@ -146,8 +138,6 @@ def pdf_worker(state: AgentState):
     print("📄 PDF Agent is searching...")
     query = state["messages"][-1].content
     try:
-        embedding_model = get_embedding_model()
-        chroma_client = get_chroma_client()
         collection = chroma_client.get_collection(name="pdf_docs")
         results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=2)
         context = "\n".join(results['documents'][0])
@@ -185,7 +175,6 @@ def code_worker(state: AgentState):
     
     local_vars = {}
     try:
-        # LAZY LOAD heavy charting libraries only when needed
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
