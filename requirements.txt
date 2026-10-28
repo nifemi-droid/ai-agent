@@ -6,3 +6,6 @@ pandas
 langgraph
 langchain-groq
 langchain-core
+chromadb
+pypdf
+sentence-transformers
