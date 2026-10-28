@@ -1,5 +1,5 @@
 from nicegui import ui, app
-from multi_agent import ask_agent_v2, ingest_file
+from multi_agent import ask_agent_v2_stream, ingest_file
 from database import (ensure_dbs_exist, create_user, authenticate_user, 
                       create_session, get_sessions, load_messages, save_message, 
                       delete_session, get_analytics)
@@ -7,7 +7,6 @@ import base64
 
 ensure_dbs_exist()
 
-# --- AUTHENTICATION GUARD ---
 def is_logged_in():
     return 'user_id' in app.storage.user
 
@@ -125,9 +124,7 @@ def main_page():
 
             # --- CLEAN INPUT AREA ---
             with ui.row().classes('w-full max-w-4xl mx-auto items-center mt-4 gap-4 px-4 pb-4'):
-                # Hidden File Input
                 file_input = ui.element('input').props('type=file accept=".pdf,.csv,.xlsx,.xls" style="display: none;"')
-                
                 file_input.on('change', lambda e: ui.run_javascript('''
                     const file = document.querySelector('input[type=file]').files[0];
                     if (file) {
@@ -147,13 +144,10 @@ def main_page():
 
                 ui.on('file_uploaded', process_file_event)
 
-                # Paperclip Button
                 ui.button(icon='attach_file', on_click=lambda: ui.run_javascript('document.querySelector("input[type=file]").click()')).props('round flat color=gray').classes('shadow-none text-gray-500')
                 
-                # Text Input
                 user_input = ui.input(placeholder='Ask anything...').props('rounded outlined dense').classes('flex-grow text-lg shadow-sm')
                 
-                # Send Button
                 async def send_message():
                     if not user_input.value: return
                     prompt = user_input.value
@@ -164,20 +158,22 @@ def main_page():
                         ui.chat_message(prompt, name='You', sent=True).classes('w-full')
                     
                     with chat_container:
-                        with ui.chat_message(name='Nexus', sent=False).classes('w-full') as thinking_msg:
-                            with ui.row().classes('items-center'):
-                                ui.spinner(size='sm', color='primary')
-                                ui.label('Routing agents...').classes('text-gray-500 italic')
+                        with ui.chat_message(name='Nexus', sent=False).classes('w-full') as ai_msg:
+                            status_label = ui.label('Starting...').classes('text-gray-500 italic text-sm mb-2')
+                            answer_label = ui.markdown('')
                     
-                    steps, answer = await ui.run.io_bound(ask_agent_v2, prompt)
+                    final_answer = ""
                     
-                    chat_container.remove(thinking_msg)
+                    # Consume the generator for live streaming updates
+                    async for msg_type, content in ask_agent_v2_stream(prompt):
+                        if msg_type == "step":
+                            status_label.text = content
+                        elif msg_type == "answer":
+                            final_answer = content
+                            answer_label.content = final_answer
+                            status_label.visible = False
                     
-                    save_message(app.storage.user['current_session'], 'assistant', answer)
-                    with chat_container:
-                        with ui.chat_message(name='Nexus', sent=False).classes('w-full'):
-                            ui.markdown(answer)
-                    
+                    save_message(app.storage.user['current_session'], 'assistant', final_answer)
                     refresh_sidebar()
 
                 ui.button(icon='send', on_click=send_message).props('round color=primary').classes('h-12 w-12 shadow-md')
