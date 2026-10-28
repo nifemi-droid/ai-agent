@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import base64
 from agent import ask_agent, execute_approved_tool
 from multi_agent import ask_multi_agent, ingest_file
 from database import (ensure_dbs_exist, create_session, get_sessions, 
@@ -20,14 +19,86 @@ if "current_session_id" not in st.session_state:
     else:
         st.session_state.current_session_id = create_session("New Chat")
 
+# Initialize theme in session state if it doesn't exist
+if "theme" not in st.session_state:
+    st.session_state.theme = "Light"
+
+# --- DYNAMIC THEME CSS ---
+if st.session_state.theme == "Light":
+    bg_color = "#FFFFFF"
+    text_color = "#31333F"
+    sidebar_bg = "#F0F2F6"
+    chat_bg = "#F0F2F6"
+    border_color = "#E0E0E0"
+else:
+    bg_color = "#0E1117"
+    text_color = "#FAFAFA"
+    sidebar_bg = "#262730"
+    chat_bg = "#262730"
+    border_color = "#444444"
+
+st.markdown(f"""
+<style>
+    /* Main App */
+    .stApp {{
+        background-color: {bg_color} !important;
+        color: {text_color} !important;
+    }}
+    
+    /* Sidebar */
+    [data-testid="stSidebar"] {{
+        background-color: {sidebar_bg} !important;
+    }}
+    
+    /* Force all text inside sidebar to be the correct color */
+    [data-testid="stSidebar"] * {{
+        color: {text_color} !important;
+    }}
+    
+    /* Chat Bubbles */
+    [data-testid="stChatMessage"] {{
+        background-color: {chat_bg} !important;
+        border: 1px solid {border_color};
+        border-radius: 12px;
+        padding: 15px;
+    }}
+    
+    /* Chat Input */
+    [data-testid="stChatInput"] {{
+        background-color: {chat_bg} !important;
+        border: 1px solid {border_color} !important;
+        border-radius: 15px;
+    }}
+    
+    /* Buttons */
+    .stButton>button {{
+        color: {text_color} !important;
+        background-color: {chat_bg} !important;
+        border: 1px solid {border_color} !important;
+        border-radius: 8px;
+    }}
+    .stButton>button:hover {{
+        border-color: #FF4B4B !important;
+    }}
+</style>
+""", unsafe_allow_html=True)
+
 # --- SIDEBAR ---
 with st.sidebar:
-    # Custom Header with Logo
     st.markdown("<h1 style='text-align: center;'>🌌 Nexus AI</h1>", unsafe_allow_html=True)
     st.divider()
     
-    # Theme Toggle Switch
-    theme_toggle = st.toggle("🌙 Dark Mode", value=False)
+    # The Real Toggle
+    # We use a segmented control or toggle to switch the session state
+    theme_choice = st.radio("Theme", ["☀️ Light", "🌙 Dark"], horizontal=True, label_visibility="collapsed")
+    
+    if "Light" in theme_choice and st.session_state.theme != "Light":
+        st.session_state.theme = "Light"
+        st.rerun()
+    elif "Dark" in theme_choice and st.session_state.theme != "Dark":
+        st.session_state.theme = "Dark"
+        st.rerun()
+
     st.divider()
     
     if st.button("➕ New Chat", use_container_width=True):
@@ -54,7 +125,6 @@ with st.sidebar:
                 st.rerun()
 
     st.divider()
-    
     with st.expander("⚙️ Settings & Admin"):
         agent_mode = st.radio("Agent Mode", ["Standard Agent", "Multi-Agent Router"])
         if st.checkbox("View Analytics"):
@@ -69,28 +139,7 @@ with st.sidebar:
                 df = pd.DataFrame(data, columns=["Query", "Tool", "Latency", "Time"])
                 st.dataframe(df, use_container_width=True)
 
-# --- APPLY DYNAMIC THEME (STREAMLIT NATIVE) ---
-# We use a small JS injection to click the native theme toggle if the switch is on
-if theme_toggle:
-    st.markdown("""
-        <script>
-            // This script triggers Streamlit's native dark mode button in the top right menu
-            const menu = window.parent.document.querySelector('[data-testid="stMainMenu"]');
-            if (menu) { menu.click(); }
-        </script>
-    """, unsafe_allow_html=True)
-
 # --- MAIN CHAT AREA ---
-# Add some styling to the main area
-st.markdown("""
-<style>
-    /* Center the chat container and make it look clean */
-    .block-container { padding-top: 2rem; padding-bottom: 2rem; }
-    .stChatMessage { border-radius: 10px; padding: 1rem; margin-bottom: 1rem; }
-    .stChatInput { border-radius: 20px; }
-</style>
-""", unsafe_allow_html=True)
-
 st.title("How can I help you today?")
 st.caption("Nexus AI can analyze PDFs, CSVs, Excel files, and answer complex questions.")
 
@@ -104,11 +153,11 @@ for message in current_messages:
 col1, col2 = st.columns([11, 1])
 
 with col2:
-    with st.popover("📎", use_container_width=True):
+    with st.popover("📎"):
         st.write("Upload Data (PDF, CSV, Excel)")
         uploaded_file = st.file_uploader("Upload", type=["pdf", "csv", "xlsx", "xls"], label_visibility="collapsed")
         if uploaded_file is not None:
-            if st.button("Ingest File", use_container_width=True):
+            if st.button("Ingest File"):
                 with st.spinner("Ingesting..."):
                     res = ingest_file(uploaded_file.read(), uploaded_file.name)
                     st.success(res)
