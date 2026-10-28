@@ -39,8 +39,8 @@ with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
 
     facade.Separator()
     
-    # Removed use_container_width
-    if facade.Button("New Chat", icon="plus"):
+    # Removed the icon argument to prevent the TypeError
+    if facade.Button("➕ New Chat"):
         new_id = create_session("New Chat")
         st.session_state.current_session_id = new_id
         st.rerun()
@@ -52,13 +52,12 @@ with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
         col1, col2 = st.columns([4, 1])
         with col1:
             variant = "default" if session_id == st.session_state.current_session_id else "ghost"
-            # Removed use_container_width
             if facade.Button(title, key=session_id, variant=variant):
                 st.session_state.current_session_id = session_id
                 st.rerun()
         with col2:
-            # Removed use_container_width
-            if facade.Button("", icon="trash", key=f"del_{session_id}", variant="ghost"):
+            # Using an emoji instead of the icon argument
+            if facade.Button("🗑️", key=f"del_{session_id}", variant="ghost"):
                 delete_session(session_id)
                 if session_id == st.session_state.current_session_id:
                     st.session_state.current_session_id = create_session("New Chat")
@@ -66,7 +65,7 @@ with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
 
     facade.Separator()
     
-    with facade.Accordion("Settings & Admin", icon="settings"):
+    with facade.Accordion("⚙️ Settings & Admin"):
         agent_mode = facade.Radio("Agent Mode", options=["Standard Agent", "Multi-Agent Router"], key="agent_mode")
         if facade.Checkbox("View Analytics", key="view_analytics"):
             data = get_analytics()
@@ -100,8 +99,8 @@ with col2:
         facade.Card(title="Upload Data", description="PDF, CSV, or Excel")
         uploaded_file = st.file_uploader("Upload", type=["pdf", "csv", "xlsx", "xls"], label_visibility="collapsed")
         if uploaded_file is not None:
-            # Removed use_container_width
-            if facade.Button("Ingest File", icon="upload"):
+            # Removed icon argument
+            if facade.Button("Ingest File"):
                 with st.spinner("Ingesting..."):
                     res = ingest_file(uploaded_file.read(), uploaded_file.name)
                     facade.Alert(res, variant="success")
