@@ -13,7 +13,7 @@ def ensure_dbs_exist():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # Users Table
+    # 1. Users Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
@@ -23,7 +23,7 @@ def ensure_dbs_exist():
         )
     """)
     
-    # Sessions Table (Now linked to a user)
+    # 2. Sessions Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
@@ -34,7 +34,7 @@ def ensure_dbs_exist():
         )
     """)
     
-    # Messages Table
+    # 3. Messages Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,7 +46,7 @@ def ensure_dbs_exist():
         )
     """)
     
-    # Analytics
+    # 4. Analytics Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS analytics (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,7 +59,7 @@ def ensure_dbs_exist():
     conn.commit()
     conn.close()
 
-    # Ensure sales DB exists
+    # 5. Ensure sales DB exists (for the DB Agent)
     if not os.path.exists(SALES_DB):
         conn = sqlite3.connect(SALES_DB)
         cursor = conn.cursor()
@@ -107,7 +107,7 @@ def authenticate_user(email, password):
     conn.close()
     return row[0] if row else None
 
-# --- SESSIONS (Now user-specific) ---
+# --- SESSIONS ---
 def create_session(user_id, title="New Chat"):
     session_id = str(uuid.uuid4())
     conn = sqlite3.connect(DB_NAME)
@@ -170,3 +170,27 @@ def get_analytics():
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+# --- PROFILE HELPERS ---
+def get_user_email(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT email FROM users WHERE id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else "Unknown"
+
+def update_user_password(user_id, new_password):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(new_password), user_id))
+    conn.commit()
+    conn.close()
+
+def is_admin(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT role FROM users WHERE id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] == 'admin' if row else False
