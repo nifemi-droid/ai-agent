@@ -10,17 +10,8 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
 import operator
 
-# RAG Imports
-import chromadb
-from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
-
 if not os.getenv("GROQ_API_KEY"):
     load_dotenv()
-
-# Initialize RAG tools
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-chroma_client = chromadb.Client()
 
 # Define the State
 class AgentState(TypedDict):
@@ -29,10 +20,13 @@ class AgentState(TypedDict):
 
 llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
 
-# --- INGESTION FUNCTION (PDF, CSV, EXCEL) ---
+# --- RAG INGESTION FUNCTION (Lazy Loads Heavy Libraries) ---
 def ingest_file(file_bytes, file_name):
-    # --- PDF RAG LOGIC ---
     if file_name.endswith('.pdf'):
+        from pypdf import PdfReader
+        from sentence_transformers import SentenceTransformer
+        import chromadb
+        
         pdf = PdfReader(io.BytesIO(file_bytes))
         text = ""
         for page in pdf.pages:
@@ -41,8 +35,10 @@ def ingest_file(file_bytes, file_name):
         chunks = [line.strip() for line in text.split('\n') if len(line.strip()) > 50]
         if not chunks: return "No text found in PDF."
         
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         embeddings = embedding_model.encode(chunks).tolist()
         
+        chroma_client = chromadb.Client()
         try:
             chroma_client.delete_collection(name="pdf_docs")
         except Exception:
@@ -56,7 +52,6 @@ def ingest_file(file_bytes, file_name):
         )
         return f"Successfully ingested {len(chunks)} chunks from PDF."
         
-    # --- CSV / EXCEL LOGIC ---
     elif file_name.endswith('.csv') or file_name.endswith('.xlsx') or file_name.endswith('.xls'):
         try:
             if file_name.endswith('.csv'):
@@ -64,14 +59,10 @@ def ingest_file(file_bytes, file_name):
             else:
                 df = pd.read_excel(io.BytesIO(file_bytes))
             
-            # Clean column names (replace spaces with underscores for SQL)
             df.columns = [c.replace(' ', '_').replace('-', '_') for c in df.columns]
             
-            # Save to a temporary SQLite database
             db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data.db")
             conn = sqlite3.connect(db_path)
-            
-            # Overwrite the table every time a new file is uploaded
             df.to_sql('user_uploaded_data', conn, if_exists='replace', index=False)
             conn.close()
             
@@ -80,9 +71,8 @@ def ingest_file(file_bytes, file_name):
             return f"Error processing data file: {str(e)}"
             
     else:
-        return "Unsupported file type. Please upload PDF, CSV, or Excel."
+        return "Unsupported file type."
 
-# --- SQL QUERY TOOL FOR USER DATA ---
 def query_user_data(sql_query):
     try:
         db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data.db")
@@ -115,6 +105,12 @@ def pdf_worker(state: AgentState):
     query = state["messages"][-1].content
     
     try:
+        from sentence_transformers import SentenceTransformer
+        import chromadb
+        
+        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        chroma_client = chromadb.Client()
+        
         collection = chroma_client.get_collection(name="pdf_docs")
         query_embedding = embedding_model.encode([query]).tolist()
         results = collection.query(query_embeddings=query_embedding, n_results=2)
@@ -130,21 +126,16 @@ def user_data_worker(state: AgentState):
     print("📊 User Data Agent is working...")
     query = state["messages"][-1].content
     
-    # Ask the LLM to write a SQL query based on the user's question
     prompt = f"""You are a data analyst. The user has uploaded a file which is stored in a SQLite table called 'user_uploaded_data'. 
     Write a SQL query to answer the user's question. Return ONLY the SQL query, no markdown, no explanation.
+    User Question: {query}"""
     
-    User Question: {query}
-    """
     sql_response = llm.invoke([HumanMessage(content=prompt)])
     sql_query = sql_response.content.strip().replace("```sql", "").replace("```", "")
     
     print(f"🔧 Generated SQL: {sql_query}")
-    
-    # Run the query
     result = query_user_data(sql_query)
     
-    # Ask the LLM to summarize the result
     final_prompt = f"Here is the data result from the database: {result}\n\nPlease answer the user's question using this data: {query}"
     final_response = llm.invoke([HumanMessage(content=final_prompt)])
     
@@ -160,11 +151,11 @@ def manager(state: AgentState):
     print("🧠 Manager is deciding...")
     system_prompt = """You are a routing manager. Based on the user's message, decide which worker should handle it.
     Reply with EXACTLY one word:
-    - 'math' (for math calculations)
-    - 'db' (for the company sales database)
-    - 'user_data' (if the user is asking about the CSV or Excel file they uploaded)
-    - 'pdf' (if it asks about the uploaded PDF document)
-    - 'general' (for everything else)
+    - 'math'
+    - 'db'
+    - 'user_data' (if asking about CSV/Excel)
+    - 'pdf' (if asking about PDF)
+    - 'general'
     """
     response = llm.invoke([HumanMessage(content=system_prompt), state["messages"][-1]])
     decision = response.content.strip().lower()

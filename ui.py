@@ -6,83 +6,56 @@ from database import (ensure_dbs_exist, create_session, get_sessions,
                       delete_session, save_message, load_messages, 
                       log_analytics, get_analytics)
 
-# --- PAGE CONFIG ---
 st.set_page_config(page_title="Nexus AI", page_icon="🌌", layout="wide", initial_sidebar_state="expanded")
 
-# --- CUSTOM CSS FOR MODERN LOOK ---
-st.markdown("""
+# --- THEME & CSS INJECTION ---
+if "theme" not in st.session_state:
+    st.session_state.theme = "Light"
+
+if st.session_state.theme == "Light":
+    bg_color, text_color, sidebar_bg, chat_bg = "#FFFFFF", "#31333F", "#F0F2F6", "#F0F2F6"
+else:
+    bg_color, text_color, sidebar_bg, chat_bg = "#0E1117", "#FAFAFA", "#262730", "#262730"
+
+st.markdown(f"""
 <style>
-    /* Main background and text */
-    .stApp {
-        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-    }
-    @media (prefers-color-scheme: dark) {
-        .stApp {
-            background: linear-gradient(135deg, #1e1e2f 0%, #121212 100%);
-        }
-    }
-    
-    /* Sidebar styling */
-    [data-testid="stSidebar"] {
-        background-color: rgba(255, 255, 255, 0.1);
-        backdrop-filter: blur(10px);
-        border-right: 1px solid rgba(255,255,255,0.2);
-    }
-    
-    /* Chat message styling */
-    .stChatMessage {
-        border-radius: 15px;
-        padding: 15px;
-        margin-bottom: 10px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-    }
-    
-    /* Input box styling */
-    .stChatInput {
-        border-radius: 20px;
-    }
-    
-    /* Button styling */
-    .stButton>button {
-        border-radius: 10px;
-        transition: all 0.3s ease;
-    }
-    .stButton>button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(0,0,0,0.2);
-    }
+    .stApp {{ background-color: {bg_color} !important; color: {text_color} !important; }}
+    [data-testid="stSidebar"] {{ background-color: {sidebar_bg} !important; }}
+    [data-testid="stChatMessage"] {{ background-color: {chat_bg} !important; border-radius: 12px; padding: 10px; }}
+    [data-testid="stChatInput"] {{ background-color: {chat_bg} !important; border-radius: 15px; }}
 </style>
 """, unsafe_allow_html=True)
 
 ensure_dbs_exist()
 
-# --- SESSION STATE INITIALIZATION ---
-if "current_session_id" not in st.session_state:
-    sessions = get_sessions()
-    if sessions:
-        st.session_state.current_session_id = sessions[0][0]
-    else:
-        st.session_state.current_session_id = create_session("New Chat")
+# Cache the sessions to speed up the sidebar
+@st.cache_data(ttl=60)
+def get_cached_sessions():
+    return get_sessions()
 
-# --- SIDEBAR (CHAT HISTORY & SETTINGS) ---
+if "current_session_id" not in st.session_state:
+    sessions = get_cached_sessions()
+    st.session_state.current_session_id = sessions[0][0] if sessions else create_session("New Chat")
+
+# --- SIDEBAR ---
 with st.sidebar:
     st.title("🌌 Nexus AI")
-    
-    # Theme Toggle
     st.markdown("### Appearance")
-    theme = st.radio("Theme", ["Light Mode", "Dark Mode"], horizontal=True)
-    if theme == "Dark Mode":
-        st.markdown('<style>.stApp { background: #0E1117 !important; color: white; }</style>', unsafe_allow_html=True)
+    theme_choice = st.radio("Theme", ["Light", "Dark"], index=0 if st.session_state.theme == "Light" else 1)
+    if theme_choice != st.session_state.theme:
+        st.session_state.theme = theme_choice
+        st.rerun()
     
     st.divider()
     
     if st.button("➕ New Chat", use_container_width=True):
         new_id = create_session("New Chat")
         st.session_state.current_session_id = new_id
+        st.cache_data.clear() # Clear cache so the new chat appears immediately
         st.rerun()
 
     st.subheader("Recent Chats")
-    sessions = get_sessions()
+    sessions = get_cached_sessions()
     for session_id, title in sessions:
         col1, col2 = st.columns([4, 1])
         with col1:
@@ -95,17 +68,14 @@ with st.sidebar:
         with col2:
             if st.button("🗑️", key=f"del_{session_id}"):
                 delete_session(session_id)
+                st.cache_data.clear()
                 if session_id == st.session_state.current_session_id:
                     st.session_state.current_session_id = create_session("New Chat")
                 st.rerun()
 
     st.divider()
-    
     with st.expander("⚙️ Settings & Admin"):
-        st.markdown("**Mode Selection**")
         agent_mode = st.radio("Agent Mode", ["Standard Agent", "Multi-Agent Router"])
-        
-        st.markdown("**Admin Dashboard**")
         if st.checkbox("View Analytics"):
             data = get_analytics()
             if not data:
@@ -120,7 +90,6 @@ with st.sidebar:
 
 # --- MAIN CHAT AREA ---
 st.title("How can I help you today?")
-st.caption("Nexus AI can analyze PDFs, CSVs, Excel files, and answer complex questions.")
 
 current_messages = load_messages(st.session_state.current_session_id)
 
@@ -128,12 +97,10 @@ for message in current_messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# --- CHAT INPUT & FILE UPLOADER ---
 col1, col2 = st.columns([11, 1])
-
 with col2:
     with st.popover("📎"):
-        st.write("Upload Data (PDF, CSV, Excel)")
+        st.write("Upload Data")
         uploaded_file = st.file_uploader("Upload", type=["pdf", "csv", "xlsx", "xls"], label_visibility="collapsed")
         if uploaded_file is not None:
             if st.button("Ingest File"):
@@ -144,9 +111,9 @@ with col2:
 with col1:
     prompt = st.chat_input("Ask anything...")
 
-# --- HANDLE USER INPUT ---
 if prompt:
     save_message(st.session_state.current_session_id, "user", prompt)
+    st.cache_data.clear() # Clear cache to update chat history titles
     with st.chat_message("user"):
         st.markdown(prompt)
 
@@ -180,4 +147,5 @@ if prompt:
                 st.markdown(final_answer)
     
     save_message(st.session_state.current_session_id, "assistant", final_answer)
+    st.cache_data.clear() 
     st.rerun()
