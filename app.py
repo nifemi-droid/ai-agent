@@ -61,4 +61,4 @@ def settings_page():
     # Admin dashboard and other settings go here
     # Example: ui.table with analytics data
 
-ui.run(title='Nexus AI', storage_secret='a-very-secret-key-change-me')
+ui.run(title='Nexus AI', storage_secret='my_super_secret_key_12345')
