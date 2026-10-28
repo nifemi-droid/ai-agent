@@ -3,6 +3,8 @@ import datetime
 import sqlite3
 import io
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 from typing import TypedDict, Annotated, Sequence
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -21,32 +23,25 @@ if not os.getenv("GROQ_API_KEY"):
 
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
-# Define the State
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     next_agent: str
 
-# --- THE FALLBACK LOGIC ---
-# Primary Model
+# --- FALLBACK MODELS ---
 llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
-
-# Fallback Model
 fallback_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
 
 def safe_llm_invoke(messages):
     try:
-        # Try the primary model
         return llm.invoke(messages)
     except Exception as e:
-        print(f"⚠️ Primary model failed: {e}. Switching to fallback model...")
+        print(f"⚠️ Primary model failed: {e}. Switching to fallback...")
         try:
-            # Try the fallback model
             return fallback_llm.invoke(messages)
         except Exception as fallback_error:
-            print(f"❌ Fallback model also failed: {fallback_error}")
-            return AIMessage(content="I'm sorry, but my AI systems are currently experiencing an outage. Please try again in a few minutes.")
+            return AIMessage(content="My AI systems are currently offline. Please try again later.")
 
-# --- INGESTION FUNCTION ---
+# --- INGESTION ---
 def ingest_file(file_bytes, file_name):
     if file_name.endswith('.pdf'):
         pdf = PdfReader(io.BytesIO(file_bytes))
@@ -103,8 +98,9 @@ def manager(state: AgentState):
     print("🧠 Manager is deciding...")
     system_prompt = """You are a routing manager. Decide which worker should handle it. Reply with EXACTLY one word:
     - 'web' (for internet searches, news, current events)
-    - 'math' (for calculations)
-    - 'user_data' (for CSV/Excel questions)
+    - 'math' (for pure math calculations like 2+2)
+    - 'code' (for data analysis, statistics, correlation, or plotting charts from CSV/Excel)
+    - 'user_data' (for simple SQL lookups from CSV/Excel)
     - 'pdf' (for PDF questions)
     - 'general' (for chatting, time, etc.)"""
     response = safe_llm_invoke([HumanMessage(content=system_prompt), state["messages"][-1]])
@@ -112,6 +108,7 @@ def manager(state: AgentState):
     
     if "web" in decision: return {"next_agent": "web"}
     elif "math" in decision: return {"next_agent": "math"}
+    elif "code" in decision: return {"next_agent": "code"}
     elif "user_data" in decision: return {"next_agent": "user_data"}
     elif "pdf" in decision: return {"next_agent": "pdf"}
     else: return {"next_agent": "general"}
@@ -158,6 +155,35 @@ def user_data_worker(state: AgentState):
     final_response = safe_llm_invoke([HumanMessage(content=f"Data: {result}\n\nAnswer: {query}")])
     return {"messages": [AIMessage(content=final_response.content)]}
 
+def code_worker(state: AgentState):
+    print("🐍 Code Agent is writing Python...")
+    query = state["messages"][-1].content
+    
+    prompt = f"""You are a Python Data Analyst. The user's data is in SQLite at 'user_data.db' in table 'user_uploaded_data'.
+    Write Python code using pandas to answer the question.
+    - Load data: `conn = sqlite3.connect('user_data.db')`, `df = pd.read_sql_query("SELECT * FROM user_uploaded_data", conn)`
+    - If plotting: use matplotlib/seaborn and save to 'output_plot.png'. Do NOT use plt.show().
+    - Store the final text answer in a variable called `final_answer`.
+    - Return ONLY raw Python code. No markdown, no ```python.
+    
+    Question: {query}"""
+    
+    code_response = safe_llm_invoke([HumanMessage(content=prompt)])
+    python_code = code_response.content.strip().replace("```python", "").replace("```", "")
+    print(f"🔧 Generated Code:\n{python_code}")
+    
+    local_vars = {}
+    try:
+        exec(python_code, {"pd": pd, "sqlite3": sqlite3, "plt": plt, "sns": sns}, local_vars)
+        final_answer = local_vars.get("final_answer", "Code executed, but no text answer was generated.")
+        
+        if os.path.exists("output_plot.png"):
+            final_answer += "\n\n[PLOT_GENERATED]"
+            
+        return {"messages": [AIMessage(content=final_answer)]}
+    except Exception as e:
+        return {"messages": [AIMessage(content=f"Error executing code: {str(e)}")]}
+
 def general_worker(state: AgentState):
     print("💬 General Agent is answering...")
     response = safe_llm_invoke(state["messages"])
@@ -169,45 +195,31 @@ def blocked_node(state: AgentState):
 # --- BUILD GRAPH ---
 workflow = StateGraph(AgentState)
 
-# Add nodes explicitly
 workflow.add_node("guardrail", guardrail_node)
 workflow.add_node("manager", manager)
 workflow.add_node("web_worker", web_worker)
 workflow.add_node("math_worker", math_worker)
 workflow.add_node("pdf_worker", pdf_worker)
 workflow.add_node("user_data_worker", user_data_worker)
+workflow.add_node("code_worker", code_worker)
 workflow.add_node("general_worker", general_worker)
 workflow.add_node("blocked", blocked_node)
 
-# Set entry point
 workflow.set_entry_point("guardrail")
 
-# Add conditional edges
-workflow.add_conditional_edges(
-    "guardrail",
-    lambda x: x["next_agent"],
-    {"blocked": "blocked", "manager": "manager"}
-)
+workflow.add_conditional_edges("guardrail", lambda x: x["next_agent"], {"blocked": "blocked", "manager": "manager"})
 
-workflow.add_conditional_edges(
-    "manager",
-    lambda x: x["next_agent"],
-    {
-        "web": "web_worker",
-        "math": "math_worker",
-        "pdf": "pdf_worker",
-        "user_data": "user_data_worker",
-        "general": "general_worker"
-    }
-)
+workflow.add_conditional_edges("manager", lambda x: x["next_agent"], {
+    "web": "web_worker",
+    "math": "math_worker",
+    "pdf": "pdf_worker",
+    "user_data": "user_data_worker",
+    "code": "code_worker",
+    "general": "general_worker"
+})
 
-# Add edges to END
-workflow.add_edge("web_worker", END)
-workflow.add_edge("math_worker", END)
-workflow.add_edge("pdf_worker", END)
-workflow.add_edge("user_data_worker", END)
-workflow.add_edge("general_worker", END)
-workflow.add_edge("blocked", END)
+for n in ["web_worker", "math_worker", "pdf_worker", "user_data_worker", "code_worker", "general_worker", "blocked"]:
+    workflow.add_edge(n, END)
 
 multi_agent_app = workflow.compile()
 
@@ -226,7 +238,10 @@ def ask_agent_v2(user_message):
             elif node_name == "blocked": 
                 steps.append("🛑 **Blocked**")
                 final_answer = node_output["messages"][-1].content
+            elif node_name == "code_worker":
+                steps.append("🐍 **Code Agent** is executing Python...")
+                final_answer = node_output["messages"][-1].content
             else:
                 steps.append(f"⚙️ **{node_name.replace('_', ' ').title()}** is working...")
                 final_answer = node_output["messages"][-1].content
-    return steps, final_answer
+    return steps, final_answer,

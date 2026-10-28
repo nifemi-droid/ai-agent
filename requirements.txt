@@ -11,3 +11,5 @@ chromadb
 pypdf
 sentence-transformers
 openpyxl
+matplotlib
+seaborn
