@@ -83,16 +83,16 @@ def main_page():
             refresh_chat()
 
             # Input Area (Fixed at the bottom)
-            with ui.row().classes('w-full max-w-4xl mx-auto items-center mt-4 gap-2'):
+            with ui.row().classes('w-full max-w-4xl mx-auto items-center mt-4 gap-4'):
                 
                 # Clean File Uploader (Paperclip)
                 with ui.upload(on_upload=lambda e: handle_upload(e), auto_upload=True).props('flat dense hide-upload-btn').classes('w-12 h-12 flex-none') as uploader:
-                    with ui.button(icon='attach_file').props('round flat'):
+                    with ui.button(icon='attach_file').props('round flat color=gray'):
                         pass
                 uploader.tooltip('Upload PDF, CSV, or Excel')
                 
-                # Text Input
-                user_input = ui.input(placeholder='Ask anything...').props('rounded outlined dense').classes('flex-grow text-lg')
+                # Text Input (with better styling)
+                user_input = ui.input(placeholder='Ask anything...').props('rounded outlined dense').classes('flex-grow text-lg shadow-sm border-gray-300')
                 
                 # Send Button
                 async def send_message():
@@ -126,7 +126,7 @@ def main_page():
                     
                     refresh_sidebar()
 
-                ui.button(icon='send', on_click=send_message).props('round color=primary').classes('h-12 w-12')
+                ui.button(icon='send', on_click=send_message).props('round color=primary').classes('h-12 w-12 shadow-md')
 
                 # Allow pressing Enter to send
                 user_input.on('keydown.enter', send_message)
