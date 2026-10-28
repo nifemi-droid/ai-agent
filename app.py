@@ -84,8 +84,11 @@ def main_page():
 
             # Input Area (Fixed at the bottom)
             with ui.row().classes('w-full max-w-4xl mx-auto items-center mt-4 gap-2'):
-                # File Uploader
-                uploader = ui.upload(on_upload=lambda e: handle_upload(e), auto_upload=True).props('flat dense').classes('w-12 h-12')
+                
+                # Clean File Uploader (Paperclip)
+                with ui.upload(on_upload=lambda e: handle_upload(e), auto_upload=True).props('flat dense hide-upload-btn').classes('w-12 h-12 flex-none') as uploader:
+                    with ui.button(icon='attach_file').props('round flat'):
+                        pass
                 uploader.tooltip('Upload PDF, CSV, or Excel')
                 
                 # Text Input
@@ -155,8 +158,8 @@ def settings_page():
         if not data:
             ui.label('No analytics data yet.').classes('text-gray-500')
         else:
-                        # Summary Metrics
-            with ui.row().classes('gap-4 mb-6'):
+            # Summary Metrics
+            with ui.row().classes('gap-4 mb-6 w-full'):
                 with ui.card().classes('w-1/3'):
                     ui.label('Total Queries').classes('text-gray-500')
                     ui.label(str(len(data))).classes('text-h3')
@@ -169,6 +172,7 @@ def settings_page():
                 with ui.card().classes('w-1/3'):
                     ui.label('Tools Used').classes('text-gray-500')
                     ui.label(str(len(set([r[1] for r in data])))).classes('text-h3')
+            
             # Table of recent activity
             ui.label('Recent Activity').classes('text-h5 mb-2')
             columns = [
@@ -181,4 +185,4 @@ def settings_page():
             ui.table(columns=columns, rows=rows).classes('w-full')
 
 # Start the app with a storage secret to handle cookies
-ui.run(title='Nexus AI', storage_secret='super_secret_nexus_key_123', dark=True, favicon='🌌')
+ui.run(title='Nexus AI', storage_secret='super_secret_nexus_key_123', dark=True, favicon='🌌', reload=True)
