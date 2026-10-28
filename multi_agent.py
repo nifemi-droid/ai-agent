@@ -26,18 +26,25 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     next_agent: str
 
+# --- THE FALLBACK LOGIC ---
+# Primary Model
 llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
+
+# Fallback Model
+fallback_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
 
 def safe_llm_invoke(messages):
     try:
+        # Try the primary model
         return llm.invoke(messages)
     except Exception as e:
-        print(f"⚠️ Primary model failed: {e}. Trying fallback...")
+        print(f"⚠️ Primary model failed: {e}. Switching to fallback model...")
         try:
-            fallback_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
+            # Try the fallback model
             return fallback_llm.invoke(messages)
         except Exception as fallback_error:
-            return AIMessage(content="My AI systems are currently offline. Please try again later.")
+            print(f"❌ Fallback model also failed: {fallback_error}")
+            return AIMessage(content="I'm sorry, but my AI systems are currently experiencing an outage. Please try again in a few minutes.")
 
 # --- INGESTION FUNCTION ---
 def ingest_file(file_bytes, file_name):
