@@ -131,7 +131,6 @@ def web_worker(state: AgentState):
         prompt = f"Answer using this web data:\n{context}\n\nQuestion: {query}"
         response = safe_llm_invoke([HumanMessage(content=prompt)])
         
-        # Append sources
         sources_text = "\n\n[SOURCES]" + "|".join(urls)
         return {"messages": [AIMessage(content=response.content + sources_text)]}
     except Exception:
@@ -194,7 +193,6 @@ def code_worker(state: AgentState):
 
 def image_worker(state: AgentState):
     query = state["messages"][-1].content
-    # Use free Pollinations AI API
     encoded_prompt = quote(query)
     image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
     

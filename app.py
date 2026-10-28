@@ -1,12 +1,16 @@
-from nicegui import ui, app
+from nicegui import ui, app, context
 from multi_agent import ask_agent_v2_stream, ingest_file
 from database import (ensure_dbs_exist, create_user, authenticate_user, 
                       create_session, get_sessions, load_messages, save_message, 
                       delete_session, get_analytics, get_user_email, update_user_password, is_admin)
 import base64
 import os
+import asyncio
 
 ensure_dbs_exist()
+
+# Global task reference for stopping generation
+current_task = None
 
 def is_logged_in():
     return 'user_id' in app.storage.user
@@ -47,6 +51,8 @@ def login_page():
 
 @ui.page('/')
 def main_page():
+    global current_task
+    
     if not is_logged_in():
         ui.navigate.to('/login')
         return
@@ -118,27 +124,32 @@ def main_page():
 
         # --- MAIN CHAT AREA ---
         with ui.column().classes('flex-grow h-full flex flex-col relative'):
+            
+            # Auto-scroll JS
+            ui.add_head_html('''
+                <script>
+                    function scrollToBottom() {
+                        const el = document.querySelector('.q-page-container');
+                        if (el) el.scrollTop = el.scrollHeight;
+                    }
+                </script>
+            ''')
+            
             chat_container = ui.column().classes('w-full max-w-3xl mx-auto gap-6 overflow-y-auto flex-grow p-4 pb-24')
             
             def render_message_content(container, content):
-                """Helper to parse and render plots, sources, and images"""
-                # 1. Plot Generation
                 if "[PLOT_GENERATED]" in content:
                     clean = content.replace("[PLOT_GENERATED]", "")
                     with container: ui.markdown(clean).classes('w-full text-gray-200')
                     if os.path.exists("output_plot.png"):
                         with container: ui.image("output_plot.png").classes('w-full rounded-lg mt-2 border border-gray-700')
                         os.remove("output_plot.png")
-                
-                # 2. Image Generation
                 elif "[IMAGE_GENERATED]" in content:
                     parts = content.split("[IMAGE_GENERATED]")
                     with container: ui.markdown(parts[0]).classes('w-full text-gray-200')
                     if len(parts) > 1:
                         img_url = parts[1].strip()
                         with container: ui.image(img_url).classes('w-full rounded-lg mt-2 border border-gray-700')
-                
-                # 3. Web Sources
                 elif "[SOURCES]" in content:
                     parts = content.split("[SOURCES]")
                     with container: ui.markdown(parts[0]).classes('w-full text-gray-200')
@@ -147,10 +158,10 @@ def main_page():
                     for url in urls:
                         if url.strip():
                             with container: ui.link(url, url).classes('text-xs text-blue-400 hover:underline block truncate')
-                
-                # 4. Normal Text
                 else:
-                    with container: ui.markdown(content).classes('w-full text-gray-200')
+                    with container: 
+                        # Use NiceGUI's code block for syntax highlighting
+                        ui.markdown(content).classes('w-full text-gray-200')
 
             def refresh_chat():
                 chat_container.clear()
@@ -168,6 +179,7 @@ def main_page():
                                 ui.icon('auto_awesome', size='md').classes('text-blue-400 mt-1')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
                                     render_message_content(ui.column().classes('w-full'), msg['content'])
+                ui.run_javascript('scrollToBottom()')
 
             refresh_chat()
 
@@ -199,10 +211,18 @@ def main_page():
                     
                     user_input = ui.input(placeholder='Ask anything...').props('borderless dense').classes('flex-grow text-white bg-transparent')
                     
+                    # STOP BUTTON (Hidden by default)
+                    stop_btn = ui.button('Stop', icon='stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('mr-2 hidden')
+                    
                     async def send_message():
+                        global current_task
                         if not user_input.value: return
                         prompt = user_input.value
                         user_input.value = ''
+                        
+                        # UI updates
+                        stop_btn.classes(remove='hidden')
+                        send_btn.classes(add='hidden')
                         
                         save_message(app.storage.user['current_session'], 'user', prompt)
                         
@@ -218,21 +238,40 @@ def main_page():
                                     status_label = ui.label('Thinking...').classes('text-gray-400 italic text-sm not-prose')
                                     answer_container = ui.column().classes('w-full')
                         
+                        ui.run_javascript('scrollToBottom()')
+                        
                         final_answer = ""
-                        async for msg_type, content in ask_agent_v2_stream(prompt):
-                            if msg_type == "step":
-                                status_label.text = content
-                            elif msg_type == "answer":
-                                final_answer = content
-                                status_label.visible = False
-                                answer_container.clear()
-                                render_message_content(answer_container, final_answer)
-                                ai_row.find('icon').classes('animate-pulse', remove=True)
+                        try:
+                            # Store task reference so we can cancel it
+                            current_task = asyncio.current_task()
+                            
+                            async for msg_type, content in ask_agent_v2_stream(prompt):
+                                if msg_type == "step":
+                                    status_label.text = content
+                                elif msg_type == "answer":
+                                    final_answer = content
+                                    status_label.visible = False
+                                    answer_container.clear()
+                                    render_message_content(answer_container, final_answer)
+                                    ai_row.find('icon').classes('animate-pulse', remove=True)
+                                    ui.run_javascript('scrollToBottom()')
+                        except asyncio.CancelledError:
+                            status_label.text = "⏹️ Generation stopped by user."
+                            final_answer = "Generation stopped."
+                        finally:
+                            current_task = None
+                            stop_btn.classes(add='hidden')
+                            send_btn.classes(remove='hidden')
                         
                         save_message(app.storage.user['current_session'], 'assistant', final_answer)
                         refresh_sidebar()
 
-                    ui.button(icon='send', on_click=send_message).props('flat round dense color=blue-400').classes('mr-2')
+                    def stop_generation():
+                        global current_task
+                        if current_task:
+                            current_task.cancel()
+
+                    send_btn = ui.button(icon='send', on_click=send_message).props('flat round dense color=blue-400').classes('mr-2')
                     user_input.on('keydown.enter', send_message)
 
             async def handle_upload_logic(file_name, file_bytes):
@@ -257,7 +296,6 @@ def settings_page():
         
     with ui.column().classes('w-full max-w-4xl mx-auto p-8 bg-gray-900 min-h-screen'):
         
-        # --- PROFILE SECTION ---
         ui.label('Profile').classes('text-h5 text-white mb-4')
         with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-4 mb-8'):
             current_email = get_user_email(user_id)
@@ -277,7 +315,6 @@ def settings_page():
 
         ui.separator().classes('bg-gray-700 my-8')
         
-        # --- ADMIN DASHBOARD ---
         if is_admin(user_id):
             ui.label('Analytics Dashboard (Admin)').classes('text-h5 text-white mb-4')
             data = get_analytics()
