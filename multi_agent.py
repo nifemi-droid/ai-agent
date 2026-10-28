@@ -3,6 +3,7 @@ import datetime
 import sqlite3
 import io
 import pandas as pd
+import asyncio
 from typing import TypedDict, Annotated, Sequence
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -21,10 +22,13 @@ if not os.getenv("GROQ_API_KEY"):
 
 tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
-# --- GLOBAL INITIALIZATION (Loads once at startup) ---
+# --- GLOBAL INITIALIZATION ---
 print("Loading embedding model into memory...")
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-chroma_client = chromadb.Client()
+
+# PERSISTENT CHROMA DB: This saves to the 'chroma_db' folder on your Mac
+print("Connecting to persistent vector database...")
+chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
@@ -219,13 +223,17 @@ async def ask_agent_v2_stream(user_message):
         for node_name, node_output in event.items():
             if node_name == "guardrail": 
                 yield ("step", f"🛡️ **Guardrail**: `{node_output.get('next_agent').upper()}`")
+                await asyncio.sleep(0.5)
             elif node_name == "manager": 
                 yield ("step", f"🧠 **Manager** routed to: `{node_output.get('next_agent').upper()}`")
+                await asyncio.sleep(0.5)
             elif node_name == "blocked": 
                 yield ("answer", node_output["messages"][-1].content)
             elif node_name == "code_worker":
                 yield ("step", "🐍 **Code Agent** is executing Python...")
+                await asyncio.sleep(0.5)
                 yield ("answer", node_output["messages"][-1].content)
             else:
                 yield ("step", f"⚙️ **{node_name.replace('_', ' ').title()}** is working...")
+                await asyncio.sleep(0.5)
                 yield ("answer", node_output["messages"][-1].content)
