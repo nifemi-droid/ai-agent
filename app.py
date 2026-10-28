@@ -2,6 +2,7 @@ from nicegui import ui, app
 from multi_agent import ask_agent_v2, ingest_file
 from database import ensure_dbs_exist, create_session, get_sessions, load_messages, save_message, delete_session, get_analytics
 import os
+import base64
 
 ensure_dbs_exist()
 
@@ -19,9 +20,7 @@ def main_page():
     with ui.header().classes('items-center justify-between bg-blue-900 text-white p-4'):
         ui.label('🌌 Nexus AI').classes('text-h5 font-bold')
         with ui.row().classes('items-center gap-4'):
-            # Dark mode switch
             ui.switch('Dark Mode', on_change=lambda e: dark.enable() if e.value else dark.disable())
-            # Link to settings page
             ui.button(icon='settings', on_click=lambda: ui.navigate.to('/settings')).props('flat round color=white')
 
     # 4. Build the Main Layout
@@ -30,10 +29,8 @@ def main_page():
         # --- SIDEBAR ---
         with ui.column().classes('w-64 bg-gray-100 dark:bg-gray-800 p-4 h-full overflow-y-auto border-r'):
             ui.button('➕ New Chat', on_click=lambda: create_new_chat()).classes('w-full bg-blue-600 text-white mb-4')
-            
             ui.label('Recent Chats').classes('text-sm font-bold text-gray-500 mt-4 mb-2')
             
-            # Container for the chat list
             chat_list_container = ui.column().classes('w-full gap-1')
             
             def refresh_sidebar():
@@ -41,9 +38,7 @@ def main_page():
                 for sid, title in get_sessions():
                     is_active = (sid == app.storage.user['current_session'])
                     with ui.row().classes('w-full items-center justify-between hover:bg-gray-200 dark:hover:bg-gray-700 rounded p-1 cursor-pointer'):
-                        # Clicking the title loads the chat
                         ui.label(title).classes('truncate text-sm flex-grow' + (' font-bold text-blue-600' if is_active else '')).on('click', lambda s=sid: load_chat(s))
-                        # Delete button
                         ui.button(icon='delete', on_click=lambda s=sid: remove_chat(s)).props('flat dense color=grey size=sm')
 
             def create_new_chat():
@@ -82,17 +77,38 @@ def main_page():
 
             refresh_chat()
 
-            # Input Area (Fixed at the bottom)
-            with ui.row().classes('w-full max-w-4xl mx-auto items-center mt-4 gap-4'):
+            # --- THE NEW INPUT AREA ---
+            with ui.row().classes('w-full max-w-4xl mx-auto items-center mt-4 gap-4 px-4 pb-4'):
                 
-                # Clean File Uploader (Paperclip)
-                with ui.upload(on_upload=lambda e: handle_upload(e), auto_upload=True).props('flat dense hide-upload-btn').classes('w-12 h-12 flex-none') as uploader:
-                    with ui.button(icon='attach_file').props('round flat color=gray'):
-                        pass
-                uploader.tooltip('Upload PDF, CSV, or Excel')
+                # Hidden file input
+                file_input = ui.element('input').props('type=file accept=".pdf,.csv,.xlsx,.xls" style="display: none;"')
                 
-                # Text Input (with better styling)
-                user_input = ui.input(placeholder='Ask anything...').props('rounded outlined dense').classes('flex-grow text-lg shadow-sm border-gray-300')
+                # JS to read file and emit event
+                file_input.on('change', lambda e: ui.run_javascript('''
+                    const file = document.querySelector('input[type=file]').files[0];
+                    if (file) {
+                        const reader = new FileReader();
+                        reader.onload = (event) => {
+                            const base64Data = event.target.result.split(',')[1];
+                            emitEvent('file_uploaded', {name: file.name, data: base64Data});
+                        };
+                        reader.readAsDataURL(file);
+                    }
+                '''))
+
+                # Python listener for the JS event
+                async def process_file_event(e):
+                    file_name = e.args['name']
+                    file_bytes = base64.b64decode(e.args['data'])
+                    await handle_upload_logic(file_name, file_bytes)
+
+                ui.on('file_uploaded', process_file_event)
+
+                # Paperclip Button
+                ui.button(icon='attach_file', on_click=lambda: ui.run_javascript('document.querySelector("input[type=file]").click()')).props('round flat color=gray').classes('shadow-none text-gray-500')
+                
+                # Text Input
+                user_input = ui.input(placeholder='Ask anything...').props('rounded outlined dense').classes('flex-grow text-lg shadow-sm')
                 
                 # Send Button
                 async def send_message():
@@ -100,25 +116,20 @@ def main_page():
                     prompt = user_input.value
                     user_input.value = ''
                     
-                    # Save & display user message
                     save_message(app.storage.user['current_session'], 'user', prompt)
                     with chat_container:
                         ui.chat_message(prompt, name='You', sent=True).classes('w-full')
                     
-                    # Create a temporary "Thinking" bubble
                     with chat_container:
                         with ui.chat_message(name='Nexus', sent=False).classes('w-full') as thinking_msg:
                             with ui.row().classes('items-center'):
                                 ui.spinner(size='sm', color='primary')
                                 ui.label('Routing agents...').classes('text-gray-500 italic')
                     
-                    # Call the AI
                     steps, answer = await ui.run.io_bound(ask_agent_v2, prompt)
                     
-                    # Remove the thinking bubble
                     chat_container.remove(thinking_msg)
                     
-                    # Save & display AI response
                     save_message(app.storage.user['current_session'], 'assistant', answer)
                     with chat_container:
                         with ui.chat_message(name='Nexus', sent=False).classes('w-full'):
@@ -128,14 +139,10 @@ def main_page():
 
                 ui.button(icon='send', on_click=send_message).props('round color=primary').classes('h-12 w-12 shadow-md')
 
-                # Allow pressing Enter to send
                 user_input.on('keydown.enter', send_message)
 
-            # Handle file upload
-            async def handle_upload(e):
-                file_name = e.name
-                file_bytes = e.content.read()
-                
+            # The separate function that processes the file after JS grabs it
+            async def handle_upload_logic(file_name, file_bytes):
                 with chat_container:
                     ui.notify(f"Processing {file_name}...", type='info', position='top')
                 
@@ -146,7 +153,6 @@ def main_page():
 
 @ui.page('/settings')
 def settings_page():
-    # Simple Admin/Settings Page
     with ui.header().classes('items-center justify-between bg-blue-900 text-white p-4'):
         ui.label('⚙️ Settings & Admin').classes('text-h5 font-bold')
         ui.button('Back to Chat', on_click=lambda: ui.navigate.to('/')).props('flat color=white')
@@ -158,7 +164,6 @@ def settings_page():
         if not data:
             ui.label('No analytics data yet.').classes('text-gray-500')
         else:
-            # Summary Metrics
             with ui.row().classes('gap-4 mb-6 w-full'):
                 with ui.card().classes('w-1/3'):
                     ui.label('Total Queries').classes('text-gray-500')
@@ -173,7 +178,6 @@ def settings_page():
                     ui.label('Tools Used').classes('text-gray-500')
                     ui.label(str(len(set([r[1] for r in data])))).classes('text-h3')
             
-            # Table of recent activity
             ui.label('Recent Activity').classes('text-h5 mb-2')
             columns = [
                 {'name': 'query', 'label': 'Query', 'field': 'query', 'align': 'left'},
@@ -184,5 +188,4 @@ def settings_page():
             rows = [{'query': r[0], 'tool': r[1], 'latency': f"{r[2]:.2f}s", 'time': r[3]} for r in data]
             ui.table(columns=columns, rows=rows).classes('w-full')
 
-# Start the app with a storage secret to handle cookies
 ui.run(title='Nexus AI', storage_secret='super_secret_nexus_key_123', dark=True, favicon='🌌', reload=True)
