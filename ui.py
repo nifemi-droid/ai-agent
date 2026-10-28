@@ -30,7 +30,8 @@ if "current_session_id" not in st.session_state:
 
 # --- SIDEBAR (FACADE) ---
 with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
-    is_dark = facade.Toggle("Dark Mode", key="dark_mode")
+    # Use native Streamlit toggle to avoid facade version issues
+    is_dark = st.toggle("Dark Mode", key="dark_mode")
     
     if is_dark:
         facade.theme.apply(preset="carbon-dark")
@@ -39,7 +40,7 @@ with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
 
     facade.Separator()
     
-    # Replaced facade.Button with native st.button
+    # Use native Streamlit button to avoid facade version issues
     if st.button("➕ New Chat", use_container_width=True):
         new_id = create_session("New Chat")
         st.session_state.current_session_id = new_id
@@ -67,16 +68,18 @@ with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
     facade.Separator()
     
     with facade.Accordion("⚙️ Settings & Admin"):
-        agent_mode = facade.Radio("Agent Mode", options=["Standard Agent", "Multi-Agent Router"], key="agent_mode")
-        if facade.Checkbox("View Analytics", key="view_analytics"):
+        # Use native Streamlit radio to avoid facade version issues
+        agent_mode = st.radio("Agent Mode", ["Standard Agent", "Multi-Agent Router"], key="agent_mode")
+        
+        if st.checkbox("View Analytics"):
             data = get_analytics()
             if not data:
-                facade.Alert("No data yet.", variant="info")
+                st.info("No data yet.")
             else:
                 total = len(data)
                 avg_lat = sum([r[2] for r in data]) / total
-                facade.Metric("Total Queries", total)
-                facade.Metric("Avg Latency", f"{avg_lat:.2f}s")
+                st.metric("Total Queries", total)
+                st.metric("Avg Latency", f"{avg_lat:.2f}s")
                 df = pd.DataFrame(data, columns=["Query", "Tool", "Latency", "Time"])
                 st.dataframe(df, use_container_width=True)
 
@@ -100,7 +103,6 @@ with col2:
         facade.Card(title="Upload Data", description="PDF, CSV, or Excel")
         uploaded_file = st.file_uploader("Upload", type=["pdf", "csv", "xlsx", "xls"], label_visibility="collapsed")
         if uploaded_file is not None:
-            # Replaced facade.Button with native st.button
             if st.button("Ingest File"):
                 with st.spinner("Ingesting..."):
                     res = ingest_file(uploaded_file.read(), uploaded_file.name)
@@ -117,6 +119,7 @@ if prompt:
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
+            # Retrieve agent_mode from native radio
             agent_mode = st.session_state.get("agent_mode", "Standard Agent")
             
             if agent_mode == "Standard Agent":
@@ -147,4 +150,4 @@ if prompt:
                 st.markdown(final_answer)
     
     save_message(st.session_state.current_session_id, "assistant", final_answer)
-    st.rerun()
+    st.rerun()ui.py
