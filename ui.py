@@ -39,8 +39,8 @@ with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
 
     facade.Separator()
     
-    # Removed the icon argument to prevent the TypeError
-    if facade.Button("➕ New Chat"):
+    # Replaced facade.Button with native st.button
+    if st.button("➕ New Chat", use_container_width=True):
         new_id = create_session("New Chat")
         st.session_state.current_session_id = new_id
         st.rerun()
@@ -51,13 +51,14 @@ with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
     for session_id, title in sessions:
         col1, col2 = st.columns([4, 1])
         with col1:
-            variant = "default" if session_id == st.session_state.current_session_id else "ghost"
-            if facade.Button(title, key=session_id, variant=variant):
-                st.session_state.current_session_id = session_id
-                st.rerun()
+            if session_id == st.session_state.current_session_id:
+                st.button(f"👉 {title}", key=session_id, disabled=True, use_container_width=True)
+            else:
+                if st.button(title, key=session_id, use_container_width=True):
+                    st.session_state.current_session_id = session_id
+                    st.rerun()
         with col2:
-            # Using an emoji instead of the icon argument
-            if facade.Button("🗑️", key=f"del_{session_id}", variant="ghost"):
+            if st.button("🗑️", key=f"del_{session_id}"):
                 delete_session(session_id)
                 if session_id == st.session_state.current_session_id:
                     st.session_state.current_session_id = create_session("New Chat")
@@ -99,8 +100,8 @@ with col2:
         facade.Card(title="Upload Data", description="PDF, CSV, or Excel")
         uploaded_file = st.file_uploader("Upload", type=["pdf", "csv", "xlsx", "xls"], label_visibility="collapsed")
         if uploaded_file is not None:
-            # Removed icon argument
-            if facade.Button("Ingest File"):
+            # Replaced facade.Button with native st.button
+            if st.button("Ingest File"):
                 with st.spinner("Ingesting..."):
                     res = ingest_file(uploaded_file.read(), uploaded_file.name)
                     facade.Alert(res, variant="success")
