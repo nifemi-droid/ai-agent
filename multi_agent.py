@@ -2,6 +2,7 @@ import os
 import datetime
 import sqlite3
 import io
+import pandas as pd
 from typing import TypedDict, Annotated, Sequence
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -28,30 +29,74 @@ class AgentState(TypedDict):
 
 llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0, api_key=os.getenv("GROQ_API_KEY"))
 
-# --- RAG INGESTION FUNCTION ---
-def ingest_pdf(file_bytes):
-    pdf = PdfReader(io.BytesIO(file_bytes))
-    text = ""
-    for page in pdf.pages:
-        text += page.extract_text()
+# --- INGESTION FUNCTION (PDF, CSV, EXCEL) ---
+def ingest_file(file_bytes, file_name):
+    # --- PDF RAG LOGIC ---
+    if file_name.endswith('.pdf'):
+        pdf = PdfReader(io.BytesIO(file_bytes))
+        text = ""
+        for page in pdf.pages:
+            text += page.extract_text()
+            
+        chunks = [line.strip() for line in text.split('\n') if len(line.strip()) > 50]
+        if not chunks: return "No text found in PDF."
         
-    chunks = [line.strip() for line in text.split('\n') if len(line.strip()) > 50]
-    if not chunks: return "No text found."
-    
-    embeddings = embedding_model.encode(chunks).tolist()
-    
+        embeddings = embedding_model.encode(chunks).tolist()
+        
+        try:
+            chroma_client.delete_collection(name="pdf_docs")
+        except Exception:
+            pass
+            
+        collection = chroma_client.create_collection(name="pdf_docs")
+        collection.add(
+            embeddings=embeddings,
+            documents=chunks,
+            ids=[str(i) for i in range(len(chunks))]
+        )
+        return f"Successfully ingested {len(chunks)} chunks from PDF."
+        
+    # --- CSV / EXCEL LOGIC ---
+    elif file_name.endswith('.csv') or file_name.endswith('.xlsx') or file_name.endswith('.xls'):
+        try:
+            if file_name.endswith('.csv'):
+                df = pd.read_csv(io.BytesIO(file_bytes))
+            else:
+                df = pd.read_excel(io.BytesIO(file_bytes))
+            
+            # Clean column names (replace spaces with underscores for SQL)
+            df.columns = [c.replace(' ', '_').replace('-', '_') for c in df.columns]
+            
+            # Save to a temporary SQLite database
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data.db")
+            conn = sqlite3.connect(db_path)
+            
+            # Overwrite the table every time a new file is uploaded
+            df.to_sql('user_uploaded_data', conn, if_exists='replace', index=False)
+            conn.close()
+            
+            return f"Successfully ingested {len(df)} rows into the database."
+        except Exception as e:
+            return f"Error processing data file: {str(e)}"
+            
+    else:
+        return "Unsupported file type. Please upload PDF, CSV, or Excel."
+
+# --- SQL QUERY TOOL FOR USER DATA ---
+def query_user_data(sql_query):
     try:
-        chroma_client.delete_collection(name="pdf_docs")
-    except Exception:
-        pass
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data.db")
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.cursor()
+        cursor.execute(sql_query)
+        results = cursor.fetchall()
+        columns = [description[0] for description in cursor.description]
+        conn.close()
         
-    collection = chroma_client.create_collection(name="pdf_docs")
-    collection.add(
-        embeddings=embeddings,
-        documents=chunks,
-        ids=[str(i) for i in range(len(chunks))]
-    )
-    return f"Successfully ingested {len(chunks)} chunks."
+        if not results: return "No data found."
+        return str([dict(zip(columns, row)) for row in results])
+    except Exception as e:
+        return f"SQL Error: {str(e)}"
 
 # --- WORKERS ---
 def math_worker(state: AgentState):
@@ -81,6 +126,30 @@ def pdf_worker(state: AgentState):
     except Exception:
         return {"messages": [AIMessage(content="Please upload a PDF first.")]}
 
+def user_data_worker(state: AgentState):
+    print("📊 User Data Agent is working...")
+    query = state["messages"][-1].content
+    
+    # Ask the LLM to write a SQL query based on the user's question
+    prompt = f"""You are a data analyst. The user has uploaded a file which is stored in a SQLite table called 'user_uploaded_data'. 
+    Write a SQL query to answer the user's question. Return ONLY the SQL query, no markdown, no explanation.
+    
+    User Question: {query}
+    """
+    sql_response = llm.invoke([HumanMessage(content=prompt)])
+    sql_query = sql_response.content.strip().replace("```sql", "").replace("```", "")
+    
+    print(f"🔧 Generated SQL: {sql_query}")
+    
+    # Run the query
+    result = query_user_data(sql_query)
+    
+    # Ask the LLM to summarize the result
+    final_prompt = f"Here is the data result from the database: {result}\n\nPlease answer the user's question using this data: {query}"
+    final_response = llm.invoke([HumanMessage(content=final_prompt)])
+    
+    return {"messages": [AIMessage(content=final_response.content)]}
+
 def general_worker(state: AgentState):
     print("💬 General Agent is working...")
     response = llm.invoke(state["messages"])
@@ -91,15 +160,17 @@ def manager(state: AgentState):
     print("🧠 Manager is deciding...")
     system_prompt = """You are a routing manager. Based on the user's message, decide which worker should handle it.
     Reply with EXACTLY one word:
-    - 'math'
-    - 'db'
-    - 'pdf' (if it asks about the uploaded document)
+    - 'math' (for math calculations)
+    - 'db' (for the company sales database)
+    - 'user_data' (if the user is asking about the CSV or Excel file they uploaded)
+    - 'pdf' (if it asks about the uploaded PDF document)
     - 'general' (for everything else)
     """
     response = llm.invoke([HumanMessage(content=system_prompt), state["messages"][-1]])
     decision = response.content.strip().lower()
     
     if "math" in decision: return {"next_agent": "math"}
+    elif "user_data" in decision: return {"next_agent": "user_data"}
     elif "db" in decision: return {"next_agent": "db"}
     elif "pdf" in decision: return {"next_agent": "pdf"}
     else: return {"next_agent": "general"}
@@ -110,6 +181,7 @@ workflow.add_node("manager", manager)
 workflow.add_node("math_worker", math_worker)
 workflow.add_node("db_worker", db_worker)
 workflow.add_node("pdf_worker", pdf_worker)
+workflow.add_node("user_data_worker", user_data_worker)
 workflow.add_node("general_worker", general_worker)
 
 workflow.set_entry_point("manager")
@@ -120,6 +192,7 @@ workflow.add_conditional_edges(
         "math": "math_worker",
         "db": "db_worker",
         "pdf": "pdf_worker",
+        "user_data": "user_data_worker",
         "general": "general_worker"
     }
 )
@@ -127,6 +200,7 @@ workflow.add_conditional_edges(
 workflow.add_edge("math_worker", END)
 workflow.add_edge("db_worker", END)
 workflow.add_edge("pdf_worker", END)
+workflow.add_edge("user_data_worker", END)
 workflow.add_edge("general_worker", END)
 
 multi_agent_app = workflow.compile()
@@ -149,6 +223,9 @@ def ask_multi_agent(user_message):
                 final_answer = node_output["messages"][-1].content
             elif node_name == "pdf_worker":
                 steps.append("📄 **PDF Agent** is reading the document...")
+                final_answer = node_output["messages"][-1].content
+            elif node_name == "user_data_worker":
+                steps.append("📊 **User Data Agent** is analyzing your file...")
                 final_answer = node_output["messages"][-1].content
             elif node_name == "general_worker":
                 steps.append("💬 **General Agent** is answering...")

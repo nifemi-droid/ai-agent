@@ -1,19 +1,56 @@
 import streamlit as st
 import pandas as pd
 from agent import ask_agent, execute_approved_tool
-from multi_agent import ask_multi_agent, ingest_pdf
+from multi_agent import ask_multi_agent, ingest_file
 from database import (ensure_dbs_exist, create_session, get_sessions, 
                       delete_session, save_message, load_messages, 
                       log_analytics, get_analytics)
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="AI Agent", page_icon="🤖", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Nexus AI", page_icon="🌌", layout="wide", initial_sidebar_state="expanded")
 
-# Custom CSS to make it look cleaner
+# --- CUSTOM CSS FOR MODERN LOOK ---
 st.markdown("""
 <style>
-    .stButton>button { width: 100%; border-radius: 8px; }
-    [data-testid="stSidebar"] { min-width: 300px; max-width: 300px; }
+    /* Main background and text */
+    .stApp {
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+    }
+    @media (prefers-color-scheme: dark) {
+        .stApp {
+            background: linear-gradient(135deg, #1e1e2f 0%, #121212 100%);
+        }
+    }
+    
+    /* Sidebar styling */
+    [data-testid="stSidebar"] {
+        background-color: rgba(255, 255, 255, 0.1);
+        backdrop-filter: blur(10px);
+        border-right: 1px solid rgba(255,255,255,0.2);
+    }
+    
+    /* Chat message styling */
+    .stChatMessage {
+        border-radius: 15px;
+        padding: 15px;
+        margin-bottom: 10px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    
+    /* Input box styling */
+    .stChatInput {
+        border-radius: 20px;
+    }
+    
+    /* Button styling */
+    .stButton>button {
+        border-radius: 10px;
+        transition: all 0.3s ease;
+    }
+    .stButton>button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -27,23 +64,28 @@ if "current_session_id" not in st.session_state:
     else:
         st.session_state.current_session_id = create_session("New Chat")
 
-# --- SIDEBAR (CHAT HISTORY) ---
+# --- SIDEBAR (CHAT HISTORY & SETTINGS) ---
 with st.sidebar:
-    st.title("🤖 AI Agents")
+    st.title("🌌 Nexus AI")
+    
+    # Theme Toggle
+    st.markdown("### Appearance")
+    theme = st.radio("Theme", ["Light Mode", "Dark Mode"], horizontal=True)
+    if theme == "Dark Mode":
+        st.markdown('<style>.stApp { background: #0E1117 !important; color: white; }</style>', unsafe_allow_html=True)
+    
+    st.divider()
     
     if st.button("➕ New Chat", use_container_width=True):
         new_id = create_session("New Chat")
         st.session_state.current_session_id = new_id
         st.rerun()
 
-    st.divider()
     st.subheader("Recent Chats")
-    
     sessions = get_sessions()
     for session_id, title in sessions:
         col1, col2 = st.columns([4, 1])
         with col1:
-            # Highlight the active chat
             if session_id == st.session_state.current_session_id:
                 st.button(f"👉 {title}", key=session_id, disabled=True, use_container_width=True)
             else:
@@ -59,15 +101,10 @@ with st.sidebar:
 
     st.divider()
     
-    # Settings Expander
     with st.expander("⚙️ Settings & Admin"):
         st.markdown("**Mode Selection**")
         agent_mode = st.radio("Agent Mode", ["Standard Agent", "Multi-Agent Router"])
         
-        st.divider()
-        if st.button("Clear All Analytics"):
-            pass # Add clear analytics logic here if needed
-            
         st.markdown("**Admin Dashboard**")
         if st.checkbox("View Analytics"):
             data = get_analytics()
@@ -83,27 +120,25 @@ with st.sidebar:
 
 # --- MAIN CHAT AREA ---
 st.title("How can I help you today?")
+st.caption("Nexus AI can analyze PDFs, CSVs, Excel files, and answer complex questions.")
 
-# Get current messages
 current_messages = load_messages(st.session_state.current_session_id)
 
-# Display chat history
 for message in current_messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
 # --- CHAT INPUT & FILE UPLOADER ---
-col1, col2 = st.columns([10, 1])
+col1, col2 = st.columns([11, 1])
 
 with col2:
-    # We use an expander disguised as a file uploader button
     with st.popover("📎"):
-        st.write("Upload a PDF")
-        uploaded_pdf = st.file_uploader("Upload", type="pdf", label_visibility="collapsed")
-        if uploaded_pdf is not None:
-            if st.button("Ingest PDF"):
+        st.write("Upload Data (PDF, CSV, Excel)")
+        uploaded_file = st.file_uploader("Upload", type=["pdf", "csv", "xlsx", "xls"], label_visibility="collapsed")
+        if uploaded_file is not None:
+            if st.button("Ingest File"):
                 with st.spinner("Ingesting..."):
-                    res = ingest_pdf(uploaded_pdf.read())
+                    res = ingest_file(uploaded_file.read(), uploaded_file.name)
                     st.success(res)
 
 with col1:
@@ -111,16 +146,13 @@ with col1:
 
 # --- HANDLE USER INPUT ---
 if prompt:
-    # Save user message to DB
     save_message(st.session_state.current_session_id, "user", prompt)
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Get Agent Response
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             if agent_mode == "Standard Agent":
-                # Standard logic (Streaming)
                 response_placeholder = st.empty()
                 full_response = ""
                 stream = ask_agent(prompt, current_messages)
@@ -129,7 +161,6 @@ if prompt:
                 
                 for chunk in stream:
                     if chunk.get("requires_approval"):
-                        # We need to handle HITL (Keep it simple for now)
                         full_response = chunk["message"]
                         break
                     if chunk.get("type") == "content":
@@ -142,13 +173,11 @@ if prompt:
                 log_analytics(prompt, tool_used, latency)
                 final_answer = full_response
             else:
-                # Multi-Agent logic
                 steps, final_answer = ask_multi_agent(prompt)
                 with st.expander("🔍 View Manager's Thought Process"):
                     for step in steps:
                         st.markdown(step)
                 st.markdown(final_answer)
     
-    # Save assistant message to DB
     save_message(st.session_state.current_session_id, "assistant", final_answer)
-    st.rerun() # Refresh to update sidebar titles
+    st.rerun()
