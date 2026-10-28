@@ -2,8 +2,9 @@ from nicegui import ui, app
 from multi_agent import ask_agent_v2_stream, ingest_file
 from database import (ensure_dbs_exist, create_user, authenticate_user, 
                       create_session, get_sessions, load_messages, save_message, 
-                      delete_session, get_analytics)
+                      delete_session, get_analytics, get_user_email, update_user_password, is_admin)
 import base64
+import os
 
 ensure_dbs_exist()
 
@@ -56,7 +57,6 @@ def main_page():
         sessions = get_sessions(user_id)
         app.storage.user['current_session'] = sessions[0][0] if sessions else create_session(user_id, "New Chat")
 
-    # Set a custom dark theme palette
     dark = ui.dark_mode()
     dark.enable()
 
@@ -118,28 +118,56 @@ def main_page():
 
         # --- MAIN CHAT AREA ---
         with ui.column().classes('flex-grow h-full flex flex-col relative'):
-            
-            # Chat Container
             chat_container = ui.column().classes('w-full max-w-3xl mx-auto gap-6 overflow-y-auto flex-grow p-4 pb-24')
             
+            def render_message_content(container, content):
+                """Helper to parse and render plots, sources, and images"""
+                # 1. Plot Generation
+                if "[PLOT_GENERATED]" in content:
+                    clean = content.replace("[PLOT_GENERATED]", "")
+                    with container: ui.markdown(clean).classes('w-full text-gray-200')
+                    if os.path.exists("output_plot.png"):
+                        with container: ui.image("output_plot.png").classes('w-full rounded-lg mt-2 border border-gray-700')
+                        os.remove("output_plot.png")
+                
+                # 2. Image Generation
+                elif "[IMAGE_GENERATED]" in content:
+                    parts = content.split("[IMAGE_GENERATED]")
+                    with container: ui.markdown(parts[0]).classes('w-full text-gray-200')
+                    if len(parts) > 1:
+                        img_url = parts[1].strip()
+                        with container: ui.image(img_url).classes('w-full rounded-lg mt-2 border border-gray-700')
+                
+                # 3. Web Sources
+                elif "[SOURCES]" in content:
+                    parts = content.split("[SOURCES]")
+                    with container: ui.markdown(parts[0]).classes('w-full text-gray-200')
+                    urls = parts[1].split("|")
+                    with container: ui.label("🌐 Sources:").classes('text-xs font-bold text-gray-500 mt-2')
+                    for url in urls:
+                        if url.strip():
+                            with container: ui.link(url, url).classes('text-xs text-blue-400 hover:underline block truncate')
+                
+                # 4. Normal Text
+                else:
+                    with container: ui.markdown(content).classes('w-full text-gray-200')
+
             def refresh_chat():
                 chat_container.clear()
                 for msg in load_messages(app.storage.user['current_session']):
                     sent = msg['role'] == 'user'
                     
                     if sent:
-                        # User Message
                         with chat_container:
                             with ui.row().classes('w-full justify-end'):
                                 with ui.card().classes('bg-gray-800 text-white rounded-2xl max-w-[80%] px-4 py-2 shadow-none'):
                                     ui.markdown(msg['content'])
                     else:
-                        # AI Message (Native Markdown with Prose styling)
                         with chat_container:
                             with ui.row().classes('w-full justify-start items-start gap-4'):
                                 ui.icon('auto_awesome', size='md').classes('text-blue-400 mt-1')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
-                                    ui.markdown(msg['content']).classes('w-full text-gray-200')
+                                    render_message_content(ui.column().classes('w-full'), msg['content'])
 
             refresh_chat()
 
@@ -178,19 +206,17 @@ def main_page():
                         
                         save_message(app.storage.user['current_session'], 'user', prompt)
                         
-                        # Display User Message Immediately
                         with chat_container:
                             with ui.row().classes('w-full justify-end'):
                                 with ui.card().classes('bg-gray-800 text-white rounded-2xl max-w-[80%] px-4 py-2 shadow-none'):
                                     ui.markdown(prompt)
                         
-                        # Display AI Thinking Bubble
                         with chat_container:
                             with ui.row().classes('w-full justify-start items-start gap-4') as ai_row:
                                 ui.icon('auto_awesome', size='md').classes('text-blue-400 mt-1 animate-pulse')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
                                     status_label = ui.label('Thinking...').classes('text-gray-400 italic text-sm not-prose')
-                                    answer_label = ui.markdown('').classes('w-full text-gray-200')
+                                    answer_container = ui.column().classes('w-full')
                         
                         final_answer = ""
                         async for msg_type, content in ask_agent_v2_stream(prompt):
@@ -199,8 +225,8 @@ def main_page():
                             elif msg_type == "answer":
                                 final_answer = content
                                 status_label.visible = False
-                                # Native NiceGUI Markdown handles tables perfectly
-                                answer_label.content = final_answer
+                                answer_container.clear()
+                                render_message_content(answer_container, final_answer)
                                 ai_row.find('icon').classes('animate-pulse', remove=True)
                         
                         save_message(app.storage.user['current_session'], 'assistant', final_answer)
@@ -223,39 +249,65 @@ def settings_page():
         ui.navigate.to('/login')
         return
 
+    user_id = app.storage.user['user_id']
+
     with ui.header().classes('items-center justify-between bg-gray-900 text-white p-4 border-b border-gray-800'):
-        ui.label('⚙️ Settings & Admin').classes('text-h5 font-bold')
+        ui.label('⚙️ Settings & Profile').classes('text-h5 font-bold')
         ui.button('Back to Chat', on_click=lambda: ui.navigate.to('/')).props('flat color=white')
         
     with ui.column().classes('w-full max-w-4xl mx-auto p-8 bg-gray-900 min-h-screen'):
-        ui.label('Analytics Dashboard').classes('text-h4 mb-4 text-white')
         
-        data = get_analytics()
-        if not data:
-            ui.label('No analytics data yet.').classes('text-gray-500')
-        else:
-            with ui.row().classes('gap-4 mb-6 w-full'):
-                with ui.card().classes('w-1/3 bg-gray-800 text-white border border-gray-700'):
-                    ui.label('Total Queries').classes('text-gray-400')
-                    ui.label(str(len(data))).classes('text-h3 text-white')
-                    
-                with ui.card().classes('w-1/3 bg-gray-800 text-white border border-gray-700'):
-                    ui.label('Avg Latency').classes('text-gray-400')
-                    avg_lat = sum([r[2] for r in data]) / len(data)
-                    ui.label(f"{avg_lat:.2f}s").classes('text-h3 text-white')
-                    
-                with ui.card().classes('w-1/3 bg-gray-800 text-white border border-gray-700'):
-                    ui.label('Tools Used').classes('text-gray-400')
-                    ui.label(str(len(set([r[1] for r in data])))).classes('text-h3 text-white')
+        # --- PROFILE SECTION ---
+        ui.label('Profile').classes('text-h5 text-white mb-4')
+        with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-4 mb-8'):
+            current_email = get_user_email(user_id)
+            ui.label(f"Logged in as: {current_email}").classes('text-white mb-4')
             
-            ui.label('Recent Activity').classes('text-h5 mb-2 text-white')
-            columns = [
-                {'name': 'query', 'label': 'Query', 'field': 'query', 'align': 'left'},
-                {'name': 'tool', 'label': 'Tool', 'field': 'tool'},
-                {'name': 'latency', 'label': 'Latency', 'field': 'latency'},
-                {'name': 'time', 'label': 'Time', 'field': 'time'},
-            ]
-            rows = [{'query': r[0], 'tool': r[1], 'latency': f"{r[2]:.2f}s", 'time': r[3]} for r in data]
-            ui.table(columns=columns, rows=rows).classes('w-full bg-gray-800 text-white')
+            new_password = ui.input('New Password', password=True, password_toggle_button=True).props('outlined rounded').classes('w-full mb-2')
+            
+            async def update_password():
+                if len(new_password.value) < 6:
+                    ui.notify('Password must be at least 6 characters', type='warning')
+                    return
+                update_user_password(user_id, new_password.value)
+                ui.notify('Password updated successfully!', type='positive')
+                new_password.value = ''
+            
+            ui.button('Update Password', on_click=update_password).props('rounded color=primary')
+
+        ui.separator().classes('bg-gray-700 my-8')
+        
+        # --- ADMIN DASHBOARD ---
+        if is_admin(user_id):
+            ui.label('Analytics Dashboard (Admin)').classes('text-h5 text-white mb-4')
+            data = get_analytics()
+            if not data:
+                ui.label('No analytics data yet.').classes('text-gray-500')
+            else:
+                with ui.row().classes('gap-4 mb-6 w-full'):
+                    with ui.card().classes('w-1/3 bg-gray-800 text-white border border-gray-700'):
+                        ui.label('Total Queries').classes('text-gray-400')
+                        ui.label(str(len(data))).classes('text-h3 text-white')
+                        
+                    with ui.card().classes('w-1/3 bg-gray-800 text-white border border-gray-700'):
+                        ui.label('Avg Latency').classes('text-gray-400')
+                        avg_lat = sum([r[2] for r in data]) / len(data)
+                        ui.label(f"{avg_lat:.2f}s").classes('text-h3 text-white')
+                        
+                    with ui.card().classes('w-1/3 bg-gray-800 text-white border border-gray-700'):
+                        ui.label('Tools Used').classes('text-gray-400')
+                        ui.label(str(len(set([r[1] for r in data])))).classes('text-h3 text-white')
+                
+                ui.label('Recent Activity').classes('text-h5 mb-2 text-white')
+                columns = [
+                    {'name': 'query', 'label': 'Query', 'field': 'query', 'align': 'left'},
+                    {'name': 'tool', 'label': 'Tool', 'field': 'tool'},
+                    {'name': 'latency', 'label': 'Latency', 'field': 'latency'},
+                    {'name': 'time', 'label': 'Time', 'field': 'time'},
+                ]
+                rows = [{'query': r[0], 'tool': r[1], 'latency': f"{r[2]:.2f}s", 'time': r[3]} for r in data]
+                ui.table(columns=columns, rows=rows).classes('w-full bg-gray-800 text-white')
+        else:
+            ui.label('🔒 Admin dashboard is only visible to administrators.').classes('text-gray-500 italic')
 
 ui.run(title='Nexus AI', storage_secret='super_secret_nexus_key_123', dark=True, favicon='🌌', reload=True)

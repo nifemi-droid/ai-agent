@@ -4,6 +4,8 @@ import sqlite3
 import io
 import pandas as pd
 import asyncio
+import requests
+from urllib.parse import quote
 from typing import TypedDict, Annotated, Sequence
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -26,7 +28,6 @@ tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 print("Loading embedding model into memory...")
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# PERSISTENT CHROMA DB: This saves to the 'chroma_db' folder on your Mac
 print("Connecting to persistent vector database...")
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
@@ -103,10 +104,11 @@ def guardrail_node(state: AgentState):
 def manager(state: AgentState):
     system_prompt = """You are a routing manager. Decide which worker should handle it. Reply with EXACTLY one word:
     - 'web' (for internet searches, news, current events)
-    - 'math' (for pure math calculations like 2+2)
-    - 'code' (for data analysis, statistics, correlation, or plotting charts from CSV/Excel)
+    - 'math' (for pure math calculations)
+    - 'code' (for data analysis, statistics, or plotting charts from CSV/Excel)
     - 'user_data' (for simple SQL lookups from CSV/Excel)
     - 'pdf' (for PDF questions)
+    - 'image' (if the user asks to generate, draw, or create a picture/image)
     - 'general' (for chatting, time, etc.)"""
     response = safe_llm_invoke([HumanMessage(content=system_prompt), state["messages"][-1]])
     decision = response.content.strip().lower()
@@ -116,6 +118,7 @@ def manager(state: AgentState):
     elif "code" in decision: return {"next_agent": "code"}
     elif "user_data" in decision: return {"next_agent": "user_data"}
     elif "pdf" in decision: return {"next_agent": "pdf"}
+    elif "image" in decision: return {"next_agent": "image"}
     else: return {"next_agent": "general"}
 
 def web_worker(state: AgentState):
@@ -123,9 +126,14 @@ def web_worker(state: AgentState):
     try:
         res = tavily.search(query=query, search_depth="basic")
         context = "\n".join([f"{r['title']}: {r['content']}" for r in res['results']])
+        urls = [r['url'] for r in res['results']]
+        
         prompt = f"Answer using this web data:\n{context}\n\nQuestion: {query}"
         response = safe_llm_invoke([HumanMessage(content=prompt)])
-        return {"messages": [AIMessage(content=response.content)]}
+        
+        # Append sources
+        sources_text = "\n\n[SOURCES]" + "|".join(urls)
+        return {"messages": [AIMessage(content=response.content + sources_text)]}
     except Exception:
         return {"messages": [AIMessage(content="Web search failed.")]}
 
@@ -184,6 +192,14 @@ def code_worker(state: AgentState):
     except Exception as e:
         return {"messages": [AIMessage(content=f"Error executing code: {str(e)}")]}
 
+def image_worker(state: AgentState):
+    query = state["messages"][-1].content
+    # Use free Pollinations AI API
+    encoded_prompt = quote(query)
+    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+    
+    return {"messages": [AIMessage(content=f"Here is the image you requested:\n\n[IMAGE_GENERATED]{image_url}")]}
+
 def general_worker(state: AgentState):
     response = safe_llm_invoke(state["messages"])
     return {"messages": [response]}
@@ -200,6 +216,7 @@ workflow.add_node("math_worker", math_worker)
 workflow.add_node("pdf_worker", pdf_worker)
 workflow.add_node("user_data_worker", user_data_worker)
 workflow.add_node("code_worker", code_worker)
+workflow.add_node("image_worker", image_worker)
 workflow.add_node("general_worker", general_worker)
 workflow.add_node("blocked", blocked_node)
 
@@ -207,10 +224,10 @@ workflow.set_entry_point("guardrail")
 workflow.add_conditional_edges("guardrail", lambda x: x["next_agent"], {"blocked": "blocked", "manager": "manager"})
 workflow.add_conditional_edges("manager", lambda x: x["next_agent"], {
     "web": "web_worker", "math": "math_worker", "pdf": "pdf_worker", 
-    "user_data": "user_data_worker", "code": "code_worker", "general": "general_worker"
+    "user_data": "user_data_worker", "code": "code_worker", "image": "image_worker", "general": "general_worker"
 })
 
-for n in ["web_worker", "math_worker", "pdf_worker", "user_data_worker", "code_worker", "general_worker", "blocked"]:
+for n in ["web_worker", "math_worker", "pdf_worker", "user_data_worker", "code_worker", "image_worker", "general_worker", "blocked"]:
     workflow.add_edge(n, END)
 
 multi_agent_app = workflow.compile()
@@ -231,6 +248,10 @@ async def ask_agent_v2_stream(user_message):
                 yield ("answer", node_output["messages"][-1].content)
             elif node_name == "code_worker":
                 yield ("step", "🐍 **Code Agent** is executing Python...")
+                await asyncio.sleep(0.5)
+                yield ("answer", node_output["messages"][-1].content)
+            elif node_name == "image_worker":
+                yield ("step", "🎨 **Image Agent** is generating...")
                 await asyncio.sleep(0.5)
                 yield ("answer", node_output["messages"][-1].content)
             else:
