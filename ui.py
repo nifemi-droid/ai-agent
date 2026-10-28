@@ -11,9 +11,8 @@ from database import (ensure_dbs_exist, create_session, get_sessions,
 st.set_page_config(page_title="Nexus AI", page_icon="🌌", layout="wide", initial_sidebar_state="expanded")
 
 # --- APPLY FACADE THEME ---
-# Start with a clean light theme. You can change this to "carbon-dark" or "default-dark" later.
 facade.theme.apply(
-    preset="carbon-sage", # Try "carbon-dark" for a sleek dark mode
+    preset="carbon-sage", 
     radius="md",
     font_sans="DM Sans",
     font_link="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap"
@@ -31,20 +30,17 @@ if "current_session_id" not in st.session_state:
 
 # --- SIDEBAR (FACADE) ---
 with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
-    # Use Facade's toggle for dark mode
-    # Note: facade's dark mode is handled by swapping presets. 
-    # For now, we will keep it simple and just show the toggle.
     is_dark = facade.Toggle("Dark Mode", key="dark_mode")
     
     if is_dark:
-        # If the toggle is on, apply a dark preset
         facade.theme.apply(preset="carbon-dark")
     else:
         facade.theme.apply(preset="carbon-sage")
 
     facade.Separator()
     
-    if facade.Button("New Chat", icon="plus", use_container_width=True):
+    # Removed use_container_width
+    if facade.Button("New Chat", icon="plus"):
         new_id = create_session("New Chat")
         st.session_state.current_session_id = new_id
         st.rerun()
@@ -55,12 +51,13 @@ with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
     for session_id, title in sessions:
         col1, col2 = st.columns([4, 1])
         with col1:
-            # Highlight active chat
             variant = "default" if session_id == st.session_state.current_session_id else "ghost"
-            if facade.Button(title, key=session_id, variant=variant, use_container_width=True):
+            # Removed use_container_width
+            if facade.Button(title, key=session_id, variant=variant):
                 st.session_state.current_session_id = session_id
                 st.rerun()
         with col2:
+            # Removed use_container_width
             if facade.Button("", icon="trash", key=f"del_{session_id}", variant="ghost"):
                 delete_session(session_id)
                 if session_id == st.session_state.current_session_id:
@@ -103,6 +100,7 @@ with col2:
         facade.Card(title="Upload Data", description="PDF, CSV, or Excel")
         uploaded_file = st.file_uploader("Upload", type=["pdf", "csv", "xlsx", "xls"], label_visibility="collapsed")
         if uploaded_file is not None:
+            # Removed use_container_width
             if facade.Button("Ingest File", icon="upload"):
                 with st.spinner("Ingesting..."):
                     res = ingest_file(uploaded_file.read(), uploaded_file.name)
@@ -119,7 +117,6 @@ if prompt:
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            # Retrieve agent_mode from facade radio
             agent_mode = st.session_state.get("agent_mode", "Standard Agent")
             
             if agent_mode == "Standard Agent":
