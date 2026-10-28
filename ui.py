@@ -10,16 +10,6 @@ from database import (ensure_dbs_exist, create_session, get_sessions,
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Nexus AI", page_icon="🌌", layout="wide", initial_sidebar_state="expanded")
 
-# --- APPLY FACADE THEME ---
-facade.theme.apply(
-    preset="carbon-sage", 
-    radius="md",
-    font_sans="DM Sans",
-    font_link="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap"
-)
-
-ensure_dbs_exist()
-
 # --- SESSION STATE INITIALIZATION ---
 if "current_session_id" not in st.session_state:
     sessions = get_sessions()
@@ -28,19 +18,22 @@ if "current_session_id" not in st.session_state:
     else:
         st.session_state.current_session_id = create_session("New Chat")
 
+ensure_dbs_exist()
+
 # --- SIDEBAR (FACADE) ---
 with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
-    # Use native Streamlit toggle to avoid facade version issues
+    # Toggle for dark mode
     is_dark = st.toggle("Dark Mode", key="dark_mode")
     
+    # Apply the correct theme preset based on the toggle
     if is_dark:
-        facade.theme.apply(preset="carbon-dark")
+        facade.theme.apply(preset="carbon-sage-dark") 
     else:
         facade.theme.apply(preset="carbon-sage")
 
     facade.Separator()
     
-    # Use native Streamlit button to avoid facade version issues
+    # New Chat Button
     if st.button("➕ New Chat", use_container_width=True):
         new_id = create_session("New Chat")
         st.session_state.current_session_id = new_id
@@ -48,6 +41,7 @@ with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
 
     facade.Separator(label="Recent Chats")
     
+    # Chat History List
     sessions = get_sessions()
     for session_id, title in sessions:
         col1, col2 = st.columns([4, 1])
@@ -67,8 +61,8 @@ with facade.Sidebar(logo="🌌", footer="Nexus AI v1.0"):
 
     facade.Separator()
     
+    # Settings & Admin
     with facade.Accordion("⚙️ Settings & Admin"):
-        # Use native Streamlit radio to avoid facade version issues
         agent_mode = st.radio("Agent Mode", ["Standard Agent", "Multi-Agent Router"], key="agent_mode")
         
         if st.checkbox("View Analytics"):
@@ -119,7 +113,6 @@ if prompt:
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            # Retrieve agent_mode from native radio
             agent_mode = st.session_state.get("agent_mode", "Standard Agent")
             
             if agent_mode == "Standard Agent":
