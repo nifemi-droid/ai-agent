@@ -83,15 +83,29 @@ if page == "💬 Standard Agent (Tools)":
         save_message("assistant", full_response)
 
 # --- PAGE 2: MULTI-AGENT ROUTER ---
+# --- PAGE 2: MULTI-AGENT ROUTER ---
 elif page == "🧠 Multi-Agent Router":
     st.markdown("""
     This mode uses a **Manager Agent** to route your question to a specialist worker.
     *   **Math Agent:** Handles calculations.
     *   **DB Agent:** Handles sales data.
+    *   **PDF Agent:** Answers questions based on your uploaded document.
     *   **General Agent:** Handles everything else.
     """)
     
-    # We use a separate chat history for the multi-agent to keep it clean
+    # Add PDF Upload in the Sidebar
+    with st.sidebar:
+        st.divider()
+        st.header("Upload PDF for RAG")
+        uploaded_pdf = st.file_uploader("Choose a PDF", type="pdf")
+        if uploaded_pdf is not None:
+            if st.button("Ingest PDF"):
+                with st.spinner("Processing PDF..."):
+                    # Call the ingestion function from multi_agent.py
+                    from multi_agent import ingest_pdf
+                    result = ingest_pdf(uploaded_pdf.read())
+                    st.success(result)
+
     if "multi_messages" not in st.session_state:
         st.session_state.multi_messages = []
 
@@ -104,11 +118,16 @@ elif page == "🧠 Multi-Agent Router":
         st.session_state.multi_messages.append({"role": "user", "content": prompt})
         
         with st.chat_message("assistant"):
-            with st.spinner("🧠 Manager is routing..."):
-                response = ask_multi_agent(prompt)
-            st.markdown(response)
+            with st.spinner("🧠 Agents are collaborating..."):
+                steps, answer = ask_multi_agent(prompt)
             
-        st.session_state.multi_messages.append({"role": "assistant", "content": response})
+            with st.expander("🔍 View Manager's Thought Process"):
+                for step in steps:
+                    st.markdown(step)
+            
+            st.markdown(answer)
+            
+        st.session_state.multi_messages.append({"role": "assistant", "content": answer})
 
 # --- PAGE 3: ADMIN DASHBOARD ---
 elif page == "📊 Admin Dashboard":
