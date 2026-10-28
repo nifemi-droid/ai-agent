@@ -155,21 +155,20 @@ def settings_page():
         if not data:
             ui.label('No analytics data yet.').classes('text-gray-500')
         else:
-            # Summary Metrics
+                        # Summary Metrics
             with ui.row().classes('gap-4 mb-6'):
-                ui.card().classes('w-1/3'):
+                with ui.card().classes('w-1/3'):
                     ui.label('Total Queries').classes('text-gray-500')
                     ui.label(str(len(data))).classes('text-h3')
                     
-                ui.card().classes('w-1/3'):
+                with ui.card().classes('w-1/3'):
                     ui.label('Avg Latency').classes('text-gray-500')
                     avg_lat = sum([r[2] for r in data]) / len(data)
                     ui.label(f"{avg_lat:.2f}s").classes('text-h3')
                     
-                ui.card().classes('w-1/3'):
+                with ui.card().classes('w-1/3'):
                     ui.label('Tools Used').classes('text-gray-500')
                     ui.label(str(len(set([r[1] for r in data])))).classes('text-h3')
-            
             # Table of recent activity
             ui.label('Recent Activity').classes('text-h5 mb-2')
             columns = [
