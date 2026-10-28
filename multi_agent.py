@@ -1,10 +1,9 @@
+import streamlit as st
 import os
 import datetime
 import sqlite3
 import io
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 from typing import TypedDict, Annotated, Sequence
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -14,9 +13,7 @@ import operator
 from tavily import TavilyClient
 
 # RAG Imports
-import chromadb
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 
 if not os.getenv("GROQ_API_KEY"):
     load_dotenv()
@@ -41,6 +38,18 @@ def safe_llm_invoke(messages):
         except Exception as fallback_error:
             return AIMessage(content="My AI systems are currently offline. Please try again later.")
 
+# --- CACHED RESOURCES (Optimized Loading) ---
+@st.cache_resource
+def get_embedding_model():
+    from sentence_transformers import SentenceTransformer
+    print("Loading embedding model into memory (this happens only once)...")
+    return SentenceTransformer('all-MiniLM-L6-v2')
+
+@st.cache_resource
+def get_chroma_client():
+    import chromadb
+    return chromadb.Client()
+
 # --- INGESTION ---
 def ingest_file(file_bytes, file_name):
     if file_name.endswith('.pdf'):
@@ -51,11 +60,13 @@ def ingest_file(file_bytes, file_name):
         chunks = [line.strip() for line in text.split('\n') if len(line.strip()) > 50]
         if not chunks: return "No text found."
         
-        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        embedding_model = get_embedding_model()
         embeddings = embedding_model.encode(chunks).tolist()
-        chroma_client = chromadb.Client()
+        chroma_client = get_chroma_client()
+        
         try: chroma_client.delete_collection(name="pdf_docs")
         except: pass
+        
         collection = chroma_client.create_collection(name="pdf_docs")
         collection.add(embeddings=embeddings, documents=chunks, ids=[str(i) for i in range(len(chunks))])
         return f"Successfully ingested {len(chunks)} chunks from PDF."
@@ -135,8 +146,8 @@ def pdf_worker(state: AgentState):
     print("📄 PDF Agent is searching...")
     query = state["messages"][-1].content
     try:
-        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        chroma_client = chromadb.Client()
+        embedding_model = get_embedding_model()
+        chroma_client = get_chroma_client()
         collection = chroma_client.get_collection(name="pdf_docs")
         results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=2)
         context = "\n".join(results['documents'][0])
@@ -174,6 +185,12 @@ def code_worker(state: AgentState):
     
     local_vars = {}
     try:
+        # LAZY LOAD heavy charting libraries only when needed
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        
         exec(python_code, {"pd": pd, "sqlite3": sqlite3, "plt": plt, "sns": sns}, local_vars)
         final_answer = local_vars.get("final_answer", "Code executed, but no text answer was generated.")
         
@@ -244,4 +261,4 @@ def ask_agent_v2(user_message):
             else:
                 steps.append(f"⚙️ **{node_name.replace('_', ' ').title()}** is working...")
                 final_answer = node_output["messages"][-1].content
-    return steps, final_answer,
+    return steps, final_answer
