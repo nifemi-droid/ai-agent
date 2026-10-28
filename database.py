@@ -1,24 +1,40 @@
 import sqlite3
 import os
 import uuid
+import hashlib
 
 DB_NAME = "chat_history.db"
 SALES_DB = "sales.db"
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
 def ensure_dbs_exist():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # Sessions Table (One row per conversation)
+    # Users Table
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
+        CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
-            title TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            email TEXT UNIQUE,
+            password TEXT,
+            role TEXT DEFAULT 'user'
         )
     """)
     
-    # Messages Table (Linked to a session)
+    # Sessions Table (Now linked to a user)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            title TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
+    
+    # Messages Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -30,7 +46,7 @@ def ensure_dbs_exist():
         )
     """)
     
-    # Analytics Table
+    # Analytics
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS analytics (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,20 +85,42 @@ def ensure_dbs_exist():
         conn.commit()
         conn.close()
 
-# --- SESSION MANAGEMENT ---
-def create_session(title="New Chat"):
+# --- AUTHENTICATION ---
+def create_user(email, password):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    user_id = str(uuid.uuid4())
+    try:
+        cursor.execute("INSERT INTO users (id, email, password) VALUES (?, ?, ?)", (user_id, email, hash_password(password)))
+        conn.commit()
+        return user_id
+    except sqlite3.IntegrityError:
+        return None # Email already exists
+    finally:
+        conn.close()
+
+def authenticate_user(email, password):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE email = ? AND password = ?", (email, hash_password(password)))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+# --- SESSIONS (Now user-specific) ---
+def create_session(user_id, title="New Chat"):
     session_id = str(uuid.uuid4())
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO sessions (id, title) VALUES (?, ?)", (session_id, title))
+    cursor.execute("INSERT INTO sessions (id, user_id, title) VALUES (?, ?, ?)", (session_id, user_id, title))
     conn.commit()
     conn.close()
     return session_id
 
-def get_sessions():
+def get_sessions(user_id):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, title FROM sessions ORDER BY timestamp DESC")
+    cursor.execute("SELECT id, title FROM sessions WHERE user_id = ? ORDER BY timestamp DESC", (user_id,))
     rows = cursor.fetchall()
     conn.close()
     return rows
@@ -95,15 +133,13 @@ def delete_session(session_id):
     conn.commit()
     conn.close()
 
-# --- MESSAGE MANAGEMENT ---
+# --- MESSAGES ---
 def save_message(session_id, role, content):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Update session title if it's the first user message
     if role == "user":
         cursor.execute("SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,))
         if cursor.fetchone()[0] == 0:
-            # Use first 30 chars of message as title
             new_title = content[:30] + "..." if len(content) > 30 else content
             cursor.execute("UPDATE sessions SET title = ? WHERE id = ?", (new_title, session_id))
             
