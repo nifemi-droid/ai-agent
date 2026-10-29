@@ -44,7 +44,8 @@ class AgentState(TypedDict):
     next_agent: str
     user_id: str
 
-llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.2, api_key=GROQ_KEY)
+# --- CORRECTED GROQ MODELS ---
+llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.2, api_key=GROQ_KEY)
 fallback_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.2, api_key=GROQ_KEY)
 
 def safe_llm_invoke(messages):
