@@ -18,10 +18,12 @@ if not storage_secret or len(storage_secret) < 32:
 ensure_dbs_exist()
 current_task = None
 
+# --- GLOBAL STYLES (Icons fixed, no aggressive font override) ---
 GLOBAL_CSS = """
-<link href="https://fonts.googleapis.com/css2?family=Material+Icons" rel="stylesheet">
+<link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-    * { font-family: 'Inter', 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif; }
+    body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
@@ -42,7 +44,7 @@ def login_page():
     if is_logged_in():
         ui.navigate.to('/')
         return
-    ui.add_head_html(GLOBAL_CSS)
+    ui.add_head_html(GLOBAL_CSS, shared=True)
     with ui.column().classes('w-full h-screen items-center justify-center bg-gradient-to-br from-gray-900 to-gray-800'):
         with ui.card().classes('w-96 p-8 shadow-2xl rounded-2xl bg-gray-800 border border-gray-700'):
             ui.label('🌌 Nexus AI').classes('text-2xl text-center mb-8 font-bold text-white')
@@ -80,7 +82,7 @@ def main_page():
     if not is_logged_in():
         ui.navigate.to('/login')
         return
-    ui.add_head_html(GLOBAL_CSS)
+    ui.add_head_html(GLOBAL_CSS, shared=True)
     
     user_id = app.storage.user['user_id']
     if 'current_session' not in app.storage.user:
@@ -122,7 +124,6 @@ def main_page():
                 const el = document.querySelector('.q-page-container');
                 if (el) el.scrollTop = el.scrollHeight;
             }
-            // Multi-file reader with client-side limits
             window.readFiles = function(inputEl) {
                 const files = Array.from(inputEl.files).slice(0, 3);
                 let total = 0;
@@ -154,7 +155,7 @@ def main_page():
                 });
             };
         </script>
-    ''')
+    ''', shared=True)
 
     # --- HEADER ---
     with ui.header().classes('bg-gray-900 text-white border-b border-gray-800 px-4 py-2 items-center justify-between'):
@@ -380,7 +381,7 @@ def settings_page():
     if not is_logged_in():
         ui.navigate.to('/login')
         return
-    ui.add_head_html(GLOBAL_CSS)
+    ui.add_head_html(GLOBAL_CSS, shared=True)
 
     user_id = app.storage.user['user_id']
     user_email = get_user_email(user_id)
