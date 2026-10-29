@@ -19,6 +19,7 @@ ensure_dbs_exist()
 current_task = None
 
 GLOBAL_CSS = """
+<link href="https://fonts.googleapis.com/css2?family=Material+Icons" rel="stylesheet">
 <style>
     * { font-family: 'Inter', 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif; }
     ::-webkit-scrollbar { width: 6px; }
