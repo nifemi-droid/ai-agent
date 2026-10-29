@@ -128,8 +128,9 @@ def main_page(session: str = None):
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
                                     display_text = clean_text(m['content'])
                                     
-                                    # Check if the message *starts* with "Error" or "Web search failed"
-                                    is_err = display_text.startswith("Error:") or display_text.startswith("Web search failed") or display_text.startswith("Document error")
+                                    # Check ONLY the exact first 20 characters for hard errors
+                                    prefix = display_text[:20]
+                                    is_err = prefix.startswith("Web search failed") or prefix.startswith("Document error") or prefix.startswith("**Error:**")
                                     color = 'text-red-400' if is_err else 'text-gray-200'
                                     
                                     ui.markdown(display_text).classes(color)
@@ -260,9 +261,10 @@ def main_page(session: str = None):
                                     holder.clear()
                                     
                                     display_text = clean_text(final)
-                                    # Check if the response IS an error, not just contains the word
-                                    is_error = display_text.startswith("Web search failed") or display_text.startswith("Document error") or display_text.startswith("Error:")
-                                    color = 'text-red-400' if is_error else 'text-gray-200'
+                                    # Only red if it's the exact error string
+                                    prefix = display_text[:20]
+                                    is_err = prefix.startswith("Web search failed") or prefix.startswith("Document error")
+                                    color = 'text-red-400' if is_err else 'text-gray-200'
                                     
                                     with holder:
                                         ui.markdown(display_text).classes(color)
