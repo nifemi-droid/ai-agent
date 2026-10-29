@@ -29,7 +29,10 @@ if not TAVILY_KEY:
 tavily = TavilyClient(api_key=TAVILY_KEY)
 
 print("Loading embedding model into memory...")
+# Set offline mode to prevent slow network checks for the cached model
+os.environ["HF_HUB_OFFLINE"] = "1" 
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
 print("Connecting to persistent vector database...")
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
@@ -44,9 +47,9 @@ class AgentState(TypedDict):
     next_agent: str
     user_id: str
 
-# --- CORRECTED GROQ MODELS ---
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.2, api_key=GROQ_KEY)
-fallback_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.2, api_key=GROQ_KEY)
+# --- CORRECTED GROQ MODELS (The ones that actually work on the current API) ---
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.2, api_key=GROQ_KEY)
+fallback_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.2, api_key=GROQ_KEY)
 
 def safe_llm_invoke(messages):
     try:
