@@ -42,6 +42,12 @@ def ensure_dbs_exist():
         )
     """)
     
+    # Idempotent migration: add timestamp column if it doesn't exist
+    cursor.execute("PRAGMA table_info(users)")
+    existing_cols = [c[1] for c in cursor.fetchall()]
+    if "timestamp" not in existing_cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP")
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
@@ -133,6 +139,7 @@ def authenticate_user(email, password):
     if not row or not verify_password(password, row[1]):
         conn.close()
         return None
+    # Migrate legacy SHA256 hashes to PBKDF2 on successful login
     if not row[1].startswith("pbkdf2_sha256$"):
         cursor.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(password), row[0]))
         conn.commit()
@@ -287,6 +294,21 @@ def get_all_sessions_for_user(user_id):
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+def get_user_joined_date(user_id):
+    """Returns the account creation date as YYYY-MM-DD, or 'N/A' if missing."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT timestamp FROM users WHERE id = ?", (user_id,))
+        row = cursor.fetchone()
+    except sqlite3.OperationalError:
+        conn.close()
+        return "N/A"
+    conn.close()
+    if row and row[0]:
+        return str(row[0])[:10]
+    return "N/A"
 
 def check_rate_limit(user_id, max_tokens=10, refill_seconds=60):
     conn = sqlite3.connect(DB_NAME)

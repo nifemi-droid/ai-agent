@@ -4,7 +4,7 @@ from database import (ensure_dbs_exist, create_user, authenticate_user,
                       create_session, get_sessions, load_messages, save_message, 
                       delete_session, get_analytics, get_user_email, update_user_password, 
                       is_admin, get_user_role, get_all_sessions_for_user, get_analytics_by_route, 
-                      delete_last_message, check_rate_limit, get_rate_limit_status)
+                      delete_last_message, check_rate_limit, get_rate_limit_status, get_user_joined_date)
 import base64
 import os
 import asyncio
@@ -21,24 +21,15 @@ current_task = None
 # --- GLOBAL STYLES (safe, no user data) ---
 GLOBAL_CSS = """
 <style>
-    /* Modern typography */
     * { font-family: 'Inter', 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif; }
-    
-    /* Scrollbar */
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
-    
-    /* Chat bubble animations */
     .chat-bubble-user { animation: slideInRight 0.2s ease-out; }
     .chat-bubble-ai { animation: slideInLeft 0.2s ease-out; }
     @keyframes slideInRight { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
     @keyframes slideInLeft { from { opacity: 0; transform: translateX(-20px); } to { opacity: 1; transform: translateX(0); } }
-    
-    /* Input glow on focus */
     .modern-input:focus-within { box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.5); }
-    
-    /* Sidebar hover transitions */
     .chat-item { transition: background-color 0.15s ease; }
 </style>
 """
@@ -99,7 +90,6 @@ def main_page():
     dark = ui.dark_mode()
     dark.enable()
 
-    # --- SAFE STATIC JS (no user data) ---
     ui.add_head_html('''
         <script>
             document.addEventListener('click', function(e) {
@@ -134,7 +124,6 @@ def main_page():
         </script>
     ''')
 
-    # --- HEADER ---
     with ui.header().classes('bg-gray-900 text-white border-b border-gray-800 px-4 py-2 items-center justify-between'):
         with ui.row().classes('items-center gap-3'):
             ui.icon('auto_awesome', size='sm').classes('text-blue-400')
@@ -152,15 +141,12 @@ def main_page():
             ui.button(icon='logout', on_click=logout).props('flat round dense color=white size=sm').tooltip('Logout')
             ui.button(icon='settings', on_click=lambda: ui.navigate.to('/settings')).props('flat round dense color=white size=sm').tooltip('Settings')
 
-    # --- MAIN LAYOUT ---
     with ui.row().classes('w-full no-wrap h-[calc(100vh-60px)] bg-gray-900'):
         
         # --- SIDEBAR ---
         with ui.column().classes('w-72 bg-gray-950 h-full overflow-y-auto border-r border-gray-800 p-3'):
             ui.button('New Chat', icon='add', on_click=lambda: create_new_chat()).props('rounded flat color=blue-400 align=left').classes('w-full mb-4 text-left')
-            
             ui.label('Recent Chats').classes('text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 px-2')
-            
             chat_list_container = ui.column().classes('w-full gap-1')
             
             def refresh_sidebar():
@@ -195,7 +181,6 @@ def main_page():
 
         # --- MAIN CHAT ---
         with ui.column().classes('flex-grow h-full flex flex-col relative'):
-            
             chat_container = ui.column().classes('w-full max-w-3xl mx-auto gap-6 overflow-y-auto flex-grow p-4 pb-32')
             
             def render_message_content(container, content, msg_idx, total_msgs):
@@ -266,7 +251,6 @@ def main_page():
             # --- FLOATING INPUT BAR ---
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 shadow-2xl rounded-2xl flex-row items-center px-3 py-2 border border-gray-700 modern-input'):
-                    
                     file_input = ui.element('input').props('type=file accept=".pdf,.csv,.xlsx,.xls" style="display: none;"')
                     file_input.on('change', lambda e: ui.run_javascript('''
                         const file = document.querySelector('input[type=file]').files[0];
@@ -286,18 +270,14 @@ def main_page():
                         await handle_upload_logic(file_name, file_bytes)
 
                     ui.on('file_uploaded', process_file_event)
-
                     ui.button(icon='attach_file', on_click=lambda: ui.run_javascript('document.querySelector("input[type=file]").click()')).props('flat round dense color=grey-5 size=sm')
-                    
                     user_input = ui.input(placeholder='Ask anything...').props('borderless dense').classes('flex-grow text-white bg-transparent text-base')
-                    
                     stop_btn = ui.button('Stop', icon='stop', on_click=lambda: stop_generation()).props('flat dense color=red-400 size=sm').classes('mr-1 hidden')
                     
                     async def run_agent(prompt):
                         global current_task
                         stop_btn.classes(remove='hidden')
                         send_btn.classes(add='hidden')
-                        
                         with chat_container:
                             with ui.row().classes('w-full justify-start items-start gap-3') as ai_row:
                                 with ui.avatar().classes('bg-gradient-to-br from-blue-500 to-purple-600 animate-pulse'):
@@ -305,7 +285,6 @@ def main_page():
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
                                     status_label = ui.label('Thinking...').classes('text-gray-400 italic text-sm not-prose')
                                     answer_container = ui.column().classes('w-full')
-                        
                         ui.run_javascript('scrollToBottom()')
                         final_answer = ""
                         try:
@@ -329,7 +308,6 @@ def main_page():
                             current_task = None
                             stop_btn.classes(add='hidden')
                             send_btn.classes(remove='hidden')
-                        
                         save_message(app.storage.user['current_session'], 'assistant', final_answer, user_id)
                         messages = load_messages(app.storage.user['current_session'], user_id)
                         if len(messages) == 2:
@@ -355,7 +333,6 @@ def main_page():
                         prompt = user_input.value
                         user_input.value = ''
                         save_message(app.storage.user['current_session'], 'user', prompt, user_id)
-                        
                         with chat_container:
                             with ui.row().classes('w-full justify-end chat-bubble-user'):
                                 with ui.card().classes('bg-blue-600 text-white rounded-2xl rounded-tr-sm max-w-[80%] px-4 py-2 shadow-lg border-none'):
@@ -384,87 +361,78 @@ def settings_page():
         ui.navigate.to('/login')
         return
     ui.add_head_html(GLOBAL_CSS)
-    
+
     user_id = app.storage.user['user_id']
     user_email = get_user_email(user_id)
     user_role = get_user_role(user_id)
-    
+    joined = get_user_joined_date(user_id)
+
     with ui.header().classes('items-center justify-between bg-gray-900 text-white px-4 py-3 border-b border-gray-800'):
         ui.label('⚙️ Settings').classes('text-lg font-bold')
         ui.button('Back to Chat', on_click=lambda: ui.navigate.to('/')).props('flat color=white size=sm')
-        
-    with ui.column().classes('w-full max-w-4xl mx-auto p-6 bg-gray-900 min-h-screen'):
-        
-        # Profile Card
-        ui.label('Profile').classes('text-xl font-bold text-white mb-4')
-        with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-6 mb-6 flex-row items-center justify-between rounded-xl'):
-            with ui.column():
-                ui.label(f"Email: {user_email}").classes('text-white text-base')
+
+    with ui.column().classes('w-full max-w-3xl mx-auto p-6 bg-gray-900 min-h-screen gap-6'):
+
+        # --- PROFILE CARD ---
+        with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-6 rounded-xl'):
+            with ui.row().classes('items-center gap-4 mb-4'):
+                initials = (user_email[:2] if user_email else "??").upper()
+                ui.avatar(initials).classes('bg-gradient-to-br from-blue-500 to-purple-600 text-white text-lg font-bold')
+                with ui.column().classes('gap-0'):
+                    ui.label(user_email).classes('text-white text-base font-semibold')
+                    ui.label(f"Member since {joined}").classes('text-gray-400 text-xs')
+
+            ui.separator().classes('bg-gray-700 my-3')
+
+            with ui.row().classes('items-center gap-2'):
+                ui.label('Role:').classes('text-gray-400 text-sm')
                 badge_color = 'bg-blue-600' if user_role == 'admin' else 'bg-gray-600'
-                ui.badge(f"Role: {user_role.upper()}", color=badge_color).classes('mt-2')
-            with ui.column().classes('gap-2'):
-                new_password = ui.input('New Password', password=True, password_toggle_button=True).props('outlined dense rounded dark color=blue-400').classes('w-64')
+                ui.badge(user_role.upper(), color=badge_color).classes('text-xs')
+
+        # --- PASSWORD UPDATE ---
+        with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-6 rounded-xl'):
+            ui.label('Security').classes('text-white text-base font-semibold mb-3')
+            with ui.row().classes('items-end gap-3 w-full'):
+                new_password = ui.input('New Password', password=True, password_toggle_button=True)\
+                    .props('outlined dense rounded dark color=blue-400')\
+                    .classes('flex-grow')
                 async def update_password():
                     if len(new_password.value) < 12:
                         ui.notify('Password must be at least 12 characters', type='warning')
                         return
-                    update_user_password(user_id, new_password.value)
-                    ui.notify('Password updated successfully!', type='positive')
-                    new_password.value = ''
-                ui.button('Update Password', on_click=update_password).props('rounded color=primary size=sm')
+                    ok = update_user_password(user_id, new_password.value)
+                    if ok:
+                        ui.notify('Password updated successfully!', type='positive')
+                        new_password.value = ''
+                    else:
+                        ui.notify('Password update failed', type='negative')
+                ui.button('Update', on_click=update_password).props('rounded color=primary size=sm')
 
-        # Chat History Table
-        ui.label('My Chat History').classes('text-xl font-bold text-white mb-4')
-        sessions = get_all_sessions_for_user(user_id)
-        if not sessions:
-            ui.label('No chat history yet.').classes('text-gray-500 italic')
-        else:
-            columns = [
-                {'name': 'title', 'label': 'Chat Title', 'field': 'title', 'align': 'left'},
-                {'name': 'date', 'label': 'Created', 'field': 'date'},
-                {'name': 'actions', 'label': '', 'field': 'id'},
-            ]
-            rows = [{'id': s[0], 'title': s[1], 'date': s[2]} for s in sessions]
-            table = ui.table(columns=columns, rows=rows, row_key='id').classes('w-full bg-gray-800 text-white rounded-xl').props('flat bordered dark')
-            table.add_slot('body-cell-actions', '''
-                <q-td :props="props">
-                    <q-btn icon="delete" flat dense round color="red" @click="() => $parent.$emit('delete', props.row.id)" />
-                </q-td>
-            ''')
-            def handle_delete(e):
-                delete_session(e.args, user_id)
-                ui.notify('Chat deleted. Refreshing...', type='info')
-                ui.navigate.to('/settings')
-            table.on('delete', handle_delete)
-
-        ui.separator().classes('bg-gray-700 my-6')
-
-        # Admin Analytics
-        if is_admin(user_id):
-            ui.label('Admin Analytics').classes('text-xl font-bold text-white mb-4')
-            route_data = get_analytics_by_route()
-            if not route_data:
-                ui.label('No analytics data yet.').classes('text-gray-500')
+        # --- CHAT HISTORY ---
+        with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-6 rounded-xl'):
+            ui.label('My Chat History').classes('text-white text-base font-semibold mb-3')
+            sessions = get_all_sessions_for_user(user_id)
+            if not sessions:
+                ui.label('No chat history yet.').classes('text-gray-500 italic text-sm')
             else:
-                with ui.row().classes('w-full gap-4 mb-6'):
-                    with ui.card().classes('w-1/2 bg-gray-800 border border-gray-700 p-4 rounded-xl'):
-                        ui.label('Agent Usage').classes('text-white font-bold mb-2')
-                        chart_data = [{'value': v, 'name': k} for k, v in route_data.items()]
-                        ui.echart({
-                            'tooltip': {'trigger': 'item'},
-                            'series': [{'type': 'pie', 'radius': ['40%', '70%'], 'data': chart_data, 'label': {'color': '#fff'}}]
-                        }).classes('w-full h-64')
-                    with ui.card().classes('w-1/2 bg-gray-800 border border-gray-700 p-4 rounded-xl'):
-                        ui.label('Recent Latency').classes('text-white font-bold mb-2')
-                        recent = get_analytics()[:10]
-                        latencies = [round(r[2], 2) for r in reversed(recent)]
-                        labels = [f"Q{i+1}" for i in range(len(latencies))]
-                        ui.echart({
-                            'xAxis': {'type': 'category', 'data': labels, 'axisLabel': {'color': '#aaa'}},
-                            'yAxis': {'type': 'value', 'axisLabel': {'color': '#aaa'}},
-                            'series': [{'type': 'bar', 'data': latencies, 'itemStyle': {'color': '#3b82f6'}}]
-                        }).classes('w-full h-64')
-        else:
-            ui.label('🔒 Admin dashboard is only visible to administrators.').classes('text-gray-500 italic')
+                columns = [
+                    {'name': 'title', 'label': 'Chat Title', 'field': 'title', 'align': 'left'},
+                    {'name': 'date', 'label': 'Created', 'field': 'date'},
+                    {'name': 'actions', 'label': '', 'field': 'id'},
+                ]
+                rows = [{'id': s[0], 'title': s[1], 'date': s[2]} for s in sessions]
+                table = ui.table(columns=columns, rows=rows, row_key='id')\
+                    .classes('w-full bg-gray-800 text-white rounded-lg')\
+                    .props('flat dark')
+                table.add_slot('body-cell-actions', '''
+                    <q-td :props="props">
+                        <q-btn icon="delete" flat dense round color="red" @click="() => $parent.$emit('delete', props.row.id)" />
+                    </q-td>
+                ''')
+                def handle_delete(e):
+                    delete_session(e.args, user_id)
+                    ui.notify('Chat deleted. Refreshing...', type='info')
+                    ui.navigate.to('/settings')
+                table.on('delete', handle_delete)
 
 ui.run(title='Nexus AI', storage_secret=storage_secret, dark=True, favicon='🌌', reload=False, host='127.0.0.1', port=int(os.getenv('PORT', '8080')))
