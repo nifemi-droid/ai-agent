@@ -3,7 +3,8 @@ from multi_agent import ask_agent_v2_stream, ingest_file, generate_chat_title
 from database import (ensure_dbs_exist, create_user, authenticate_user, 
                       create_session, get_sessions, load_messages, save_message, 
                       delete_session, get_analytics, get_user_email, update_user_password, 
-                      is_admin, get_user_role, get_all_sessions_for_user, get_analytics_by_route, delete_last_message)
+                      is_admin, get_user_role, get_all_sessions_for_user, get_analytics_by_route, 
+                      delete_last_message, check_rate_limit, get_rate_limit_status)
 import base64
 import os
 import asyncio
@@ -104,6 +105,11 @@ def main_page():
             ui.label('Nexus AI').classes('text-h6 font-semibold')
             
         with ui.row().classes('items-center gap-4'):
+            # Rate Limit Badge
+            remaining = get_rate_limit_status(user_id)
+            badge_color = 'text-green-400' if remaining > 5 else 'text-yellow-400' if remaining > 0 else 'text-red-400'
+            ui.label(f'⚡ {remaining}/10').classes(f'text-sm font-bold {badge_color}').tooltip('Messages remaining this minute')
+            
             ui.switch('Dark Mode', value=True, on_change=lambda e: dark.enable() if e.value else dark.disable()).props('color=blue-400')
             
             def logout():
@@ -315,7 +321,19 @@ def main_page():
                         refresh_chat() 
 
                     async def send_message():
+                        global user_id
                         if not user_input.value: return
+                        
+                        # RATE LIMIT CHECK
+                        allowed, remaining = check_rate_limit(user_id)
+                        
+                        if not allowed:
+                            ui.notify('Rate limit exceeded. Please wait 60 seconds.', type='negative', position='top')
+                            return
+                        
+                        if remaining <= 3:
+                            ui.notify(f'Warning: You only have {remaining} messages left this minute.', type='warning', position='top')
+                        
                         prompt = user_input.value
                         user_input.value = ''
                         
@@ -327,6 +345,9 @@ def main_page():
                                     ui.markdown(prompt)
                         
                         await run_agent(prompt)
+                        
+                        # Refresh the header badge
+                        ui.navigate.to('/')
 
                     def stop_generation():
                         global current_task
