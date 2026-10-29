@@ -20,7 +20,7 @@ async def run_evaluation():
         expected = case['expected_route']
         actual_route = None
         
-        async for msg_type, content in ask_agent_v2_stream(case['query']):
+        async for msg_type, content in ask_agent_v2_stream(case['query'], "test-user"):
             if msg_type == "step" and "Manager" in content:
                 # Extract the route from the step message (e.g., "🧠 **Manager** routed to: `WEB`")
                 actual_route = content.split("`")[1].split("`")[0]

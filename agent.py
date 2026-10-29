@@ -3,31 +3,46 @@ import json
 import datetime
 import sqlite3
 import time
+import ast
+import operator
 from dotenv import load_dotenv
 from groq import Groq
 from tavily import TavilyClient
 
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+tavily = None
 
 # --- DEFINE THE TOOLS ---
 def get_current_time():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def calculate(expression):
+    allowed = {
+        ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+        ast.Div: operator.truediv, ast.Pow: operator.pow, ast.Mod: operator.mod,
+        ast.USub: operator.neg, ast.UAdd: operator.pos,
+    }
+    def evaluate(node):
+        if isinstance(node, ast.Expression): return evaluate(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in allowed:
+            left, right = evaluate(node.left), evaluate(node.right)
+            if abs(left) > 1e12 or abs(right) > 1e12: raise ValueError("Number is too large")
+            return allowed[type(node.op)](left, right)
+        if isinstance(node, ast.UnaryOp) and type(node.op) in allowed:
+            return allowed[type(node.op)](evaluate(node.operand))
+        raise ValueError("Only numeric arithmetic is allowed")
     try:
-        return str(eval(expression))
+        if len(expression) > 500: raise ValueError("Expression is too long")
+        result = evaluate(ast.parse(expression, mode="eval"))
+        return str(result)
     except Exception as e:
-        return f"Error: {str(e)}"
+        return "Error: invalid arithmetic expression"
 
 def web_search(query):
-    try:
-        response = tavily.search(query=query, search_depth="basic")
-        results = [f"{res['title']}: {res['content']}" for res in response['results']]
-        return "\n\n".join(results)
-    except Exception as e:
-        return f"Search failed: {str(e)}"
+    return "Web search is disabled to prevent third-party data leakage."
 
 def send_email(recipient, subject, body):
     return f"✅ Email successfully sent to {recipient} with subject '{subject}'."
@@ -65,7 +80,8 @@ tools_schema = [
 ]
 
 # --- THE AGENT LOOP (Now with Streaming) ---
-def ask_agent(user_message, history=[]):
+def ask_agent(user_message, history=None):
+    history = history or []
     start_time = time.time()
     used_tool = "None"
     

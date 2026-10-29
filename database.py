@@ -3,12 +3,31 @@ import os
 import uuid
 import hashlib
 import datetime
+import secrets
+import base64
 
 DB_NAME = "chat_history.db"
 SALES_DB = "sales.db"
 
+PBKDF2_ITERATIONS = 600_000
+
 def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
+
+def verify_password(password, stored_hash):
+    try:
+        algorithm, iterations, salt_b64, digest_b64 = stored_hash.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        iterations = int(iterations)
+        salt = base64.urlsafe_b64decode(salt_b64.encode())
+        expected = base64.urlsafe_b64decode(digest_b64.encode())
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+        return secrets.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return secrets.compare_digest(hashlib.sha256(password.encode("utf-8")).hexdigest(), stored_hash)
 
 def ensure_dbs_exist():
     conn = sqlite3.connect(DB_NAME)
@@ -90,6 +109,9 @@ def ensure_dbs_exist():
         conn.close()
 
 def create_user(email, password):
+    email = email.strip().lower()
+    if len(email) > 254 or "@" not in email or len(password) < 12:
+        return None
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     user_id = str(uuid.uuid4())
@@ -103,12 +125,19 @@ def create_user(email, password):
         conn.close()
 
 def authenticate_user(email, password):
+    email = email.strip().lower()
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM users WHERE email = ? AND password = ?", (email, hash_password(password)))
+    cursor.execute("SELECT id, password FROM users WHERE email = ?", (email,))
     row = cursor.fetchone()
+    if not row or not verify_password(password, row[1]):
+        conn.close()
+        return None
+    if not row[1].startswith("pbkdf2_sha256$"):
+        cursor.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(password), row[0]))
+        conn.commit()
     conn.close()
-    return row[0] if row else None
+    return row[0]
 
 def create_session(user_id, title="New Chat"):
     session_id = str(uuid.uuid4())
@@ -142,9 +171,16 @@ def delete_session(session_id, user_id):
     conn.close()
     return True
 
-def save_message(session_id, role, content):
+def save_message(session_id, role, content, user_id=None):
+    if role not in ("user", "assistant") or len(content) > 100_000:
+        return False
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    if user_id:
+        cursor.execute("SELECT 1 FROM sessions WHERE id = ? AND user_id = ?", (session_id, user_id))
+        if not cursor.fetchone():
+            conn.close()
+            return False
     if role == "user":
         cursor.execute("SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,))
         if cursor.fetchone()[0] == 0:
@@ -153,6 +189,7 @@ def save_message(session_id, role, content):
     cursor.execute("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)", (session_id, role, content))
     conn.commit()
     conn.close()
+    return True
 
 def load_messages(session_id, user_id):
     """IDOR FIX: Only load messages if the session belongs to the user."""
@@ -218,11 +255,14 @@ def get_user_email(user_id):
     return row[0] if row else "Unknown"
 
 def update_user_password(user_id, new_password):
+    if len(new_password) < 12:
+        return False
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(new_password), user_id))
     conn.commit()
     conn.close()
+    return True
 
 def is_admin(user_id):
     conn = sqlite3.connect(DB_NAME)

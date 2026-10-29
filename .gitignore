@@ -1,7 +1,13 @@
 venv/
 .env
+.env.*
+!.env.example
 __pycache__/
 .DS_Store
 *.pyc
 *.db
-chroma_db/*
+*.sqlite3
+chroma_db/
+tenant_data/
+.nicegui/
+output_plot.png

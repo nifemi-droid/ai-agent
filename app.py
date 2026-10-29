@@ -8,7 +8,12 @@ from database import (ensure_dbs_exist, create_user, authenticate_user,
 import base64
 import os
 import asyncio
+from dotenv import load_dotenv
 
+load_dotenv()
+storage_secret = os.getenv("NICEGUI_STORAGE_SECRET")
+if not storage_secret or len(storage_secret) < 32:
+    raise RuntimeError("NICEGUI_STORAGE_SECRET must be set to a random secret of at least 32 characters")
 ensure_dbs_exist()
 current_task = None
 
@@ -33,13 +38,16 @@ def login_page():
                 else:
                     ui.notify('Invalid email or password', type='negative')
             async def handle_register():
+                if len(password.value) < 12:
+                    ui.notify('Password must be at least 12 characters', type='warning')
+                    return
                 user_id = create_user(email.value, password.value)
                 if user_id:
                     app.storage.user['user_id'] = user_id
                     ui.notify('Account created!', type='positive')
                     ui.navigate.to('/')
                 else:
-                    ui.notify('Email already exists', type='warning')
+                    ui.notify('Invalid registration details or email already exists', type='warning')
             with ui.row().classes('w-full justify-between gap-2'):
                 ui.button('Login', on_click=handle_login).props('rounded color=primary').classes('w-1/2')
                 ui.button('Register', on_click=handle_register).props('flat color=primary').classes('w-1/2')
@@ -253,7 +261,7 @@ def main_page():
                         final_answer = ""
                         try:
                             current_task = asyncio.current_task()
-                            async for msg_type, content in ask_agent_v2_stream(prompt):
+                            async for msg_type, content in ask_agent_v2_stream(prompt, user_id):
                                 if msg_type == "step":
                                     status_label.text = content
                                 elif msg_type == "answer":
@@ -272,7 +280,7 @@ def main_page():
                             current_task = None
                             stop_btn.classes(add='hidden')
                             send_btn.classes(remove='hidden')
-                        save_message(app.storage.user['current_session'], 'assistant', final_answer)
+                        save_message(app.storage.user['current_session'], 'assistant', final_answer, user_id)
                         messages = load_messages(app.storage.user['current_session'], user_id)
                         if len(messages) == 2:
                             new_title = generate_chat_title(prompt)
@@ -280,7 +288,7 @@ def main_page():
                             from database import DB_NAME
                             conn = sqlite3.connect(DB_NAME)
                             cursor = conn.cursor()
-                            cursor.execute("UPDATE sessions SET title = ? WHERE id = ?", (new_title, app.storage.user['current_session']))
+                            cursor.execute("UPDATE sessions SET title = ? WHERE id = ? AND user_id = ?", (new_title, app.storage.user['current_session'], user_id))
                             conn.commit()
                             conn.close()
                         refresh_sidebar()
@@ -297,7 +305,7 @@ def main_page():
                             ui.notify(f'Warning: You only have {remaining} messages left this minute.', type='warning', position='top')
                         prompt = user_input.value
                         user_input.value = ''
-                        save_message(app.storage.user['current_session'], 'user', prompt)
+                        save_message(app.storage.user['current_session'], 'user', prompt, user_id)
                         with chat_container:
                             with ui.row().classes('w-full justify-end'):
                                 with ui.card().classes('bg-gray-800 text-white rounded-2xl max-w-[80%] px-4 py-2 shadow-none'):
@@ -315,7 +323,7 @@ def main_page():
 
             async def handle_upload_logic(file_name, file_bytes):
                 ui.notify(f"Processing {file_name}...", type='info', position='top')
-                res = await ui.run.io_bound(ingest_file, file_bytes, file_name)
+                res = await ui.run.io_bound(ingest_file, file_bytes, file_name, user_id)
                 with chat_container:
                     with ui.row().classes('w-full justify-center'):
                         ui.badge(f"📁 System: {res}", color='gray-700').classes('text-gray-300 text-xs')
@@ -341,8 +349,8 @@ def settings_page():
             with ui.column().classes('gap-2'):
                 new_password = ui.input('New Password', password=True, password_toggle_button=True).props('outlined rounded dense').classes('w-64')
                 async def update_password():
-                    if len(new_password.value) < 6:
-                        ui.notify('Password must be at least 6 characters', type='warning')
+                    if len(new_password.value) < 12:
+                        ui.notify('Password must be at least 12 characters', type='warning')
                         return
                     update_user_password(user_id, new_password.value)
                     ui.notify('Password updated successfully!', type='positive')
@@ -399,4 +407,4 @@ def settings_page():
         else:
             ui.label('🔒 Admin dashboard is only visible to administrators.').classes('text-gray-500 italic')
 
-ui.run(title='Nexus AI', storage_secret='super_secret_nexus_key_123', dark=True, favicon='🌌', reload=True)
+ui.run(title='Nexus AI', storage_secret=storage_secret, dark=True, favicon='🌌', reload=False, host='127.0.0.1', port=int(os.getenv('PORT', '8080')))
