@@ -45,6 +45,14 @@ def ensure_dbs_exist():
         )
     """)
     
+    # --- MIGRATION: Add timestamp column if missing ---
+    cursor.execute("PRAGMA table_info(users)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "timestamp" not in columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN timestamp DATETIME")
+        cursor.execute("UPDATE users SET timestamp = ? WHERE timestamp IS NULL", (datetime.datetime.now(),))
+    # --------------------------------------------------
+    
     # 2. Sessions Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
