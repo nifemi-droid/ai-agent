@@ -160,7 +160,7 @@ def main_page():
     # --- HEADER ---
     with ui.header().classes('bg-gray-900 text-white border-b border-gray-800 px-4 py-2 items-center justify-between'):
         with ui.row().classes('items-center gap-3'):
-            ui.icon('auto_awesome', size='sm').classes('text-blue-400')
+            ui.label('✨').classes('text-blue-400 text-lg')
             ui.label('Nexus AI').classes('text-lg font-bold tracking-tight')
             
         with ui.row().classes('items-center gap-3'):
@@ -172,15 +172,15 @@ def main_page():
                 del app.storage.user['user_id']
                 del app.storage.user['current_session']
                 ui.navigate.to('/login')
-            ui.button(icon='logout', on_click=logout).props('flat round dense color=white size=sm').tooltip('Logout')
-            ui.button(icon='settings', on_click=lambda: ui.navigate.to('/settings')).props('flat round dense color=white size=sm').tooltip('Settings')
+            ui.button('🚪', on_click=logout).props('flat round dense color=white size=sm').tooltip('Logout')
+            ui.button('⚙️', on_click=lambda: ui.navigate.to('/settings')).props('flat round dense color=white size=sm').tooltip('Settings')
 
     # --- MAIN LAYOUT ---
     with ui.row().classes('w-full no-wrap h-[calc(100vh-60px)] bg-gray-900'):
         
         # --- SIDEBAR ---
         with ui.column().classes('w-72 bg-gray-950 h-full overflow-y-auto border-r border-gray-800 p-3'):
-            ui.button('New Chat', icon='add', on_click=lambda: create_new_chat()).props('rounded flat color=blue-400 align=left').classes('w-full mb-4 text-left')
+            ui.button('➕ New Chat', on_click=lambda: create_new_chat()).props('rounded flat color=blue-400 align=left').classes('w-full mb-4 text-left')
             ui.label('Recent Chats').classes('text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 px-2')
             chat_list_container = ui.column().classes('w-full gap-1')
             
@@ -191,7 +191,7 @@ def main_page():
                     bg = 'bg-gray-800 text-white' if is_active else 'text-gray-300 hover:bg-gray-800'
                     with ui.row().classes(f'chat-item w-full items-center justify-between rounded-lg p-2 cursor-pointer {bg}'):
                         ui.label(title).classes('truncate text-sm flex-grow').on('click', lambda s=sid: load_chat(s))
-                        ui.button(icon='delete', on_click=lambda s=sid: remove_chat(s)).props('flat dense round size=sm color=grey-5').classes('opacity-0 hover:opacity-100 transition-opacity')
+                        ui.button('🗑️', on_click=lambda s=sid: remove_chat(s)).props('flat dense round size=sm color=grey-5').classes('opacity-0 hover:opacity-100 transition-opacity')
 
             def create_new_chat():
                 new_id = create_session(user_id, "New Chat")
@@ -232,7 +232,7 @@ def main_page():
 
                 if msg_idx == total_msgs - 1:
                     with container:
-                        ui.button('Regenerate', icon='refresh', on_click=lambda: regenerate_response()).props('flat dense size=sm color=grey-5').classes('mt-2')
+                        ui.button('🔄 Regenerate', on_click=lambda: regenerate_response()).props('flat dense size=sm color=grey-5').classes('mt-2')
 
             def refresh_chat():
                 chat_container.clear()
@@ -240,7 +240,7 @@ def main_page():
                 if not messages:
                     with chat_container:
                         with ui.column().classes('w-full items-center justify-center mt-32 opacity-50'):
-                            ui.icon('auto_awesome', size='4rem').classes('text-blue-400 mb-4')
+                            ui.label('✨').classes('text-6xl text-blue-400 mb-4')
                             ui.label('How can I help you today?').classes('text-2xl font-light text-gray-400')
                 for i, msg in enumerate(messages):
                     sent = msg['role'] == 'user'
@@ -253,7 +253,7 @@ def main_page():
                         with chat_container:
                             with ui.row().classes('w-full justify-start items-start gap-3 chat-bubble-ai'):
                                 with ui.avatar().classes('bg-gradient-to-br from-blue-500 to-purple-600'):
-                                    ui.icon('auto_awesome', color='white')
+                                    ui.label('✨').classes('text-white text-lg')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
                                     render_message_content(ui.column().classes('w-full'), msg['content'], i, len(messages))
                 ui.run_javascript('scrollToBottom()')
@@ -274,7 +274,6 @@ def main_page():
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 shadow-2xl rounded-2xl flex-row items-center px-3 py-2 border border-gray-700 modern-input'):
                     
-                    # Hidden multi-file input
                     file_input = ui.element('input')\
                         .props('type=file multiple accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" style="display: none;"')\
                         .on('change', lambda e: ui.run_javascript('window.readFiles(document.querySelector("input[type=file]"))'))
@@ -292,11 +291,11 @@ def main_page():
                     ui.on('files_ready', process_files_event)
                     ui.on('upload_error', process_upload_error)
 
-                    ui.button(icon='attach_file', on_click=lambda: ui.run_javascript('document.querySelector("input[type=file]").click()')).props('flat round dense color=grey-5 size=sm').tooltip('Upload up to 3 files (10MB each, 25MB total)')
+                    ui.button('📎', on_click=lambda: ui.run_javascript('document.querySelector("input[type=file]").click()')).props('flat round dense color=grey-5 size=sm').tooltip('Upload up to 3 files (10MB each, 25MB total)')
                     
                     user_input = ui.input(placeholder='Ask a question or request a document...').props('borderless dense').classes('flex-grow text-white bg-transparent text-base')
                     
-                    stop_btn = ui.button('Stop', icon='stop', on_click=lambda: stop_generation()).props('flat dense color=red-400 size=sm').classes('mr-1 hidden')
+                    stop_btn = ui.button('⏹️ Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400 size=sm').classes('mr-1 hidden')
                     
                     async def run_agent(prompt):
                         global current_task
@@ -306,7 +305,7 @@ def main_page():
                         with chat_container:
                             with ui.row().classes('w-full justify-start items-start gap-3') as ai_row:
                                 with ui.avatar().classes('bg-gradient-to-br from-blue-500 to-purple-600 animate-pulse'):
-                                    ui.icon('auto_awesome', color='white')
+                                    ui.label('✨').classes('text-white text-lg')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
                                     status_label = ui.label('Thinking...').classes('text-gray-400 italic text-sm not-prose')
                                     answer_container = ui.column().classes('w-full')
@@ -323,7 +322,7 @@ def main_page():
                                     status_label.visible = False
                                     answer_container.clear()
                                     render_message_content(answer_container, final_answer, 999, 999)
-                                    ai_row.find('icon').classes('animate-pulse', remove=True)
+                                    ai_row.find('.animate-pulse').classes('animate-pulse', remove=True)
                                     ui.run_javascript('scrollToBottom()')
                         except asyncio.CancelledError:
                             status_label.text = "⏹️ Generation stopped by user."
@@ -373,7 +372,7 @@ def main_page():
                         if current_task:
                             current_task.cancel()
 
-                    send_btn = ui.button(icon='send', on_click=send_message).props('flat round dense color=blue-400 size=sm')
+                    send_btn = ui.button('➤', on_click=send_message).props('flat round dense color=blue-400 size=sm')
                     user_input.on('keydown.enter', send_message)
 
 @ui.page('/settings')
@@ -447,7 +446,7 @@ def settings_page():
                     .props('flat dark')
                 table.add_slot('body-cell-actions', '''
                     <q-td :props="props">
-                        <q-btn icon="delete" flat dense round color="red" @click="() => $parent.$emit('delete', props.row.id)" />
+                        <q-btn label="🗑️" flat dense round color="red" @click="() => $parent.$emit('delete', props.row.id)" />
                     </q-td>
                 ''')
                 def handle_delete(e):
