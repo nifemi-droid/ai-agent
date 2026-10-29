@@ -1,377 +1,331 @@
-import sqlite3
-import os
-import uuid
-import hashlib
-import datetime
-import secrets
+from nicegui import ui, app
+from multi_agent import ask_agent_v2_stream, generate_chat_title, ingest_files
+from database import (ensure_dbs_exist, create_session, get_sessions, load_messages,
+                      save_message, delete_session, update_user_password,
+                      get_user_email, get_all_sessions_for_user,
+                      delete_last_message, check_rate_limit, get_rate_limit_status)
 import base64
+import os
+import asyncio
+from dotenv import load_dotenv
 
-DB_NAME = "chat_history.db"
-SALES_DB = "sales.db"
+load_dotenv()
+storage_secret = os.getenv("NICEGUI_STORAGE_SECRET")
+if not storage_secret or len(storage_secret) < 32:
+    raise RuntimeError("Set NICEGUI_STORAGE_SECRET (32+ chars) in your .env")
 
-PBKDF2_ITERATIONS = 600_000
+ensure_dbs_exist()
+current_task = None
 
-def hash_password(password):
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
-    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(digest).decode()}"
+# Single-user identity
+USER_ID = "local"
 
-def verify_password(password, stored_hash):
-    try:
-        algorithm, iterations, salt_b64, digest_b64 = stored_hash.split("$", 3)
-        if algorithm != "pbkdf2_sha256":
-            return False
-        iterations = int(iterations)
-        salt = base64.urlsafe_b64decode(salt_b64.encode())
-        expected = base64.urlsafe_b64decode(digest_b64.encode())
-        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-        return secrets.compare_digest(actual, expected)
-    except (ValueError, TypeError):
-        # Fallback for legacy SHA256 hashes
-        return secrets.compare_digest(hashlib.sha256(password.encode("utf-8")).hexdigest(), stored_hash)
+GLOBAL_CSS = """
+<style>
+    body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+</style>
+"""
 
-def ensure_dbs_exist():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    
-    # 1. Users Table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            email TEXT UNIQUE,
-            password TEXT,
-            role TEXT DEFAULT 'user',
-            timestamp DATETIME
-        )
-    """)
-    
-    # --- MIGRATION: Add timestamp column if missing ---
-    cursor.execute("PRAGMA table_info(users)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if "timestamp" not in columns:
-        cursor.execute("ALTER TABLE users ADD COLUMN timestamp DATETIME")
-        cursor.execute("UPDATE users SET timestamp = ? WHERE timestamp IS NULL", (datetime.datetime.now(),))
-    # --------------------------------------------------
-    
-    # 2. Sessions Table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            user_id TEXT,
-            title TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-    """)
-    
-    # 3. Messages Table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(session_id) REFERENCES sessions(id)
-        )
-    """)
-    
-    # 4. Analytics Table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS analytics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_query TEXT,
-            tool_used TEXT,
-            latency_seconds REAL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # 5. Rate Limiting Table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS rate_limits (
-            user_id TEXT PRIMARY KEY,
-            tokens INTEGER DEFAULT 10,
-            last_reset DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # 6. Single-User Seed: Ensure 'local' admin exists
-    cursor.execute("SELECT 1 FROM users WHERE id = 'local'")
-    if not cursor.fetchone():
-        cursor.execute(
-            "INSERT INTO users (id, email, password, role, timestamp) VALUES (?, ?, ?, ?, ?)",
-            ("local", "local@localhost", hash_password("unused-seed-password-change-me"), "admin", datetime.datetime.now())
-        )
+@ui.page('/')
+def main_page():
+    global current_task
+    ui.add_head_html(GLOBAL_CSS, shared=True)
+    ui.dark_mode().enable()
+
+    if 'current_session' not in app.storage.user:
+        sessions = get_sessions(USER_ID)
+        app.storage.user['current_session'] = sessions[0][0] if sessions else create_session(USER_ID, "New Chat")
+
+    # Header
+    with ui.header().classes('bg-gray-900 border-b border-gray-800 px-4 py-2 items-center justify-between'):
+        with ui.row().classes('items-center gap-2'):
+            ui.label('✦').classes('text-blue-400 text-lg')
+            ui.label('Nexus').classes('text-lg font-bold text-white')
+        with ui.row().classes('items-center gap-3'):
+            remaining = get_rate_limit_status(USER_ID)
+            color = 'text-green-400' if remaining > 5 else 'text-yellow-400' if remaining > 0 else 'text-red-400'
+            ui.label(f'⚡ {remaining}').classes(f'text-sm {color}')
+            ui.button('⚙️ Settings', on_click=lambda: ui.navigate.to('/settings')).props('flat color=white size=sm')
+
+    # Layout
+    with ui.row().classes('w-full no-wrap h-[calc(100vh-56px)] bg-gray-900'):
         
-    conn.commit()
-    conn.close()
+        # Sidebar
+        with ui.column().classes('w-72 bg-gray-950 h-full overflow-y-auto border-r border-gray-800 p-3'):
+            ui.button('+ New Chat', on_click=lambda: new_chat()).props('flat color=blue-400 align=left').classes('w-full mb-4')
+            chat_list = ui.column().classes('w-full gap-1')
 
-    # 7. Ensure sales DB exists (legacy fallback)
-    if not os.path.exists(SALES_DB):
-        conn = sqlite3.connect(SALES_DB)
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS sales (
-                id INTEGER PRIMARY KEY,
-                product TEXT,
-                city TEXT,
-                amount REAL,
-                date TEXT
-            )
-        """)
-        data = [
-            ("Laptop", "Lagos", 1200.00, "2026-01-15"),
-            ("Phone", "Abuja", 800.00, "2026-01-16"),
-            ("Laptop", "Lagos", 1200.00, "2026-02-10"),
-            ("Headphones", "Lagos", 150.00, "2026-02-11"),
-            ("Phone", "Lagos", 800.00, "2026-03-05"),
-            ("Monitor", "Abuja", 300.00, "2026-03-15"),
-            ("Laptop", "Port Harcourt", 1200.00, "2026-04-01")
-        ]
-        cursor.executemany("INSERT INTO sales (product, city, amount, date) VALUES (?, ?, ?, ?)", data)
-        conn.commit()
-        conn.close()
+            def render_sidebar():
+                chat_list.clear()
+                for sid, title in get_sessions(USER_ID):
+                    active = sid == app.storage.user['current_session']
+                    cls = 'bg-gray-800 text-white' if active else 'text-gray-300 hover:bg-gray-800'
+                    with chat_list:
+                        with ui.row().classes(f'w-full items-center justify-between rounded p-2 cursor-pointer {cls}'):
+                            ui.label(title).classes('truncate text-sm flex-grow').on('click', lambda s=sid: switch_session(s))
+                            ui.button('×', on_click=lambda s=sid: remove_chat(s)).props('flat dense size=sm color=grey-5')
 
-def create_user(email, password):
-    email = email.strip().lower()
-    if len(email) > 254 or "@" not in email or len(password) < 12:
-        return None
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    user_id = str(uuid.uuid4())
-    now = datetime.datetime.now()
-    try:
-        cursor.execute(
-            "INSERT INTO users (id, email, password, timestamp) VALUES (?, ?, ?, ?)", 
-            (user_id, email, hash_password(password), now)
-        )
-        conn.commit()
-        return user_id
-    except sqlite3.IntegrityError:
-        return None
-    finally:
-        conn.close()
+            def new_chat():
+                app.storage.user['current_session'] = create_session(USER_ID, "New Chat")
+                render_sidebar()
+                render_chat()
 
-def authenticate_user(email, password):
-    email = email.strip().lower()
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, password FROM users WHERE email = ?", (email,))
-    row = cursor.fetchone()
-    if not row or not verify_password(password, row[1]):
-        conn.close()
-        return None
-    # Migrate legacy SHA256 hashes to PBKDF2 on successful login
-    if not row[1].startswith("pbkdf2_sha256$"):
-        cursor.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(password), row[0]))
-        conn.commit()
-    conn.close()
-    return row[0]
+            def switch_session(sid):
+                if sid == app.storage.user['current_session']:
+                    return
+                app.storage.user['current_session'] = sid
+                render_sidebar()
+                render_chat()
 
-def create_session(user_id, title="New Chat"):
-    session_id = str(uuid.uuid4())
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO sessions (id, user_id, title) VALUES (?, ?, ?)", (session_id, user_id, title))
-    conn.commit()
-    conn.close()
-    return session_id
+            def remove_chat(sid):
+                delete_session(sid, USER_ID)
+                if app.storage.user['current_session'] == sid:
+                    sessions = get_sessions(USER_ID)
+                    app.storage.user['current_session'] = sessions[0][0] if sessions else create_session(USER_ID, "New Chat")
+                render_sidebar()
+                render_chat()
 
-def get_sessions(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, title FROM sessions WHERE user_id = ? ORDER BY timestamp DESC", (user_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+            render_sidebar()
 
-def delete_session(session_id, user_id):
-    """IDOR FIX: Verify the session belongs to the user before deleting."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM sessions WHERE id = ?", (session_id,))
-    row = cursor.fetchone()
-    if not row or row[0] != user_id:
-        conn.close()
-        return False
-    cursor.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-    cursor.execute("DELETE FROM sessions WHERE id = ? AND user_id = ?", (session_id, user_id))
-    conn.commit()
-    conn.close()
-    return True
+        # Main
+        with ui.column().classes('flex-grow h-full flex flex-col relative'):
+            chat_box = ui.column().classes('w-full max-w-3xl mx-auto gap-4 overflow-y-auto flex-grow p-4 pb-40')
 
-def save_message(session_id, role, content, user_id=None):
-    if role not in ("user", "assistant") or len(content) > 100_000:
-        return False
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    if user_id:
-        cursor.execute("SELECT 1 FROM sessions WHERE id = ? AND user_id = ?", (session_id, user_id))
-        if not cursor.fetchone():
-            conn.close()
-            return False
-    if role == "user":
-        cursor.execute("SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,))
-        if cursor.fetchone()[0] == 0:
-            new_title = content[:30] + "..." if len(content) > 30 else content
-            cursor.execute("UPDATE sessions SET title = ? WHERE id = ?", (new_title, session_id))
-    cursor.execute("INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)", (session_id, role, content))
-    conn.commit()
-    conn.close()
-    return True
+            def render_chat():
+                chat_box.clear()
+                msgs = load_messages(app.storage.user['current_session'], USER_ID)
+                if not msgs:
+                    with chat_box:
+                        with ui.column().classes('w-full items-center justify-center mt-32 opacity-50'):
+                            ui.label('✦').classes('text-6xl text-blue-400 mb-4')
+                            ui.label('How can I help you today?').classes('text-2xl text-gray-400')
+                for i, m in enumerate(msgs):
+                    if m['role'] == 'user':
+                        with chat_box:
+                            with ui.row().classes('w-full justify-end items-start gap-2'):
+                                ui.button('Edit', on_click=lambda idx=i, c=m['content']: edit_prompt(idx, c)).props('flat dense size=sm color=grey-5')
+                                with ui.card().classes('bg-blue-600 text-white rounded-2xl max-w-[80%] px-4 py-2'):
+                                    ui.markdown(m['content'])
+                    else:
+                        with chat_box:
+                            with ui.row().classes('w-full justify-start items-start gap-3'):
+                                with ui.avatar().classes('bg-blue-500'):
+                                    ui.label('✦').classes('text-white')
+                                with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
+                                    if "[SOURCES]" in m['content']:
+                                        head, tail = m['content'].split("[SOURCES]", 1)
+                                        ui.markdown(head).classes('text-gray-200')
+                                        ui.label('Sources').classes('text-xs font-bold text-gray-500 mt-2')
+                                        for url in tail.split("|"):
+                                            if url.strip().startswith("http"):
+                                                ui.link(url.strip(), url.strip()).classes('text-xs text-blue-400 block truncate')
+                                    else:
+                                        ui.markdown(m['content']).classes('text-gray-200')
+                                    if i == len(msgs) - 1:
+                                        ui.button('Regenerate', on_click=lambda: regenerate()).props('flat dense size=sm color=grey-5').classes('mt-2')
+                ui.run_javascript('const e=document.querySelector(".q-page-container"); if(e) e.scrollTop=e.scrollHeight;')
 
-def load_messages(session_id, user_id):
-    """IDOR FIX: Only load messages if the session belongs to the user."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT m.role, m.content 
-        FROM messages m
-        JOIN sessions s ON m.session_id = s.id
-        WHERE m.session_id = ? AND s.user_id = ?
-        ORDER BY m.timestamp ASC
-    """, (session_id, user_id))
-    rows = cursor.fetchall()
-    conn.close()
-    return [{"role": row[0], "content": row[1]} for row in rows]
+            render_chat()
 
-def delete_last_message(session_id, user_id):
-    """IDOR FIX: Only delete if the session belongs to the user."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM sessions WHERE id = ?", (session_id,))
-    row = cursor.fetchone()
-    if not row or row[0] != user_id:
-        conn.close()
-        return False
-    cursor.execute("SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1", (session_id,))
-    row = cursor.fetchone()
-    if row:
-        cursor.execute("DELETE FROM messages WHERE id = ?", (row[0],))
-        conn.commit()
-    conn.close()
-    return True
+            async def edit_prompt(idx, content):
+                # Delete from the edited user message onward
+                while len(load_messages(app.storage.user['current_session'], USER_ID)) > idx:
+                    delete_last_message(app.storage.user['current_session'], USER_ID)
+                render_chat()
+                # Populate the input box with the old text
+                input_box.value = content
+                ui.run_javascript('const t=document.querySelector("textarea"); if(t) t.focus();')
 
-def log_analytics(user_query, tool_used, latency):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO analytics (user_query, tool_used, latency_seconds) VALUES (?, ?, ?)", (user_query, tool_used, latency))
-    conn.commit()
-    conn.close()
+            async def regenerate():
+                msgs = load_messages(app.storage.user['current_session'], USER_ID)
+                if not msgs or msgs[-1]['role'] != 'assistant':
+                    return
+                delete_last_message(app.storage.user['current_session'], USER_ID)
+                prompt = msgs[-2]['content'] if len(msgs) >= 2 else ""
+                render_chat()
+                if prompt:
+                    await run_agent(prompt)
 
-def get_analytics():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_query, tool_used, latency_seconds, timestamp FROM analytics ORDER BY timestamp DESC")
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+            # Input
+            with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
+                with ui.card().classes('w-full bg-gray-800 rounded-2xl flex-col p-2 border border-gray-700'):
+                    file_input = ui.element('input')\
+                        .props('type=file multiple accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" style="display:none"')\
+                        .on('change', lambda e: ui.run_javascript('''
+                            const f=document.querySelector("input[type=file]").files;
+                            const files=Array.from(f).slice(0,3);
+                            let total=0,out=[],pending=files.length;
+                            if(!pending) return;
+                            files.forEach(file=>{
+                                if(file.size>10*1024*1024){emitEvent("upload_error",{msg:"File exceeds 10 MB"});pending--;return;}
+                                total+=file.size;
+                                if(total>25*1024*1024){emitEvent("upload_error",{msg:"Total exceeds 25 MB"});pending--;return;}
+                                const r=new FileReader();
+                                r.onload=e=>{
+                                    out.push({name:file.name,data:e.target.result.split(",")[1]});
+                                    pending--;
+                                    if(pending===0&&out.length) emitEvent("files_ready",{files:out});
+                                };
+                                r.readAsDataURL(file);
+                            });
+                        '''))
 
-def get_analytics_by_route():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT tool_used, COUNT(*) FROM analytics GROUP BY tool_used")
-    rows = cursor.fetchall()
-    conn.close()
-    return dict(rows)
+                    async def on_files(e):
+                        res = await ui.run.io_bound(ingest_files, e.args.get('files', []), USER_ID)
+                        ui.notify(res, type='info')
 
-def get_user_email(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT email FROM users WHERE id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else "Unknown"
+                    def on_err(e):
+                        ui.notify(e.args.get('msg', 'Upload failed'), type='negative')
 
-def update_user_password(user_id, new_password):
-    if len(new_password) < 12:
-        return False
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(new_password), user_id))
-    conn.commit()
-    conn.close()
-    return True
+                    ui.on('files_ready', on_files)
+                    ui.on('upload_error', on_err)
 
-def is_admin(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT role FROM users WHERE id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] == 'admin' if row else False
+                    input_box = ui.textarea(placeholder='Ask anything — Enter to send, Shift+Enter for new line')\
+                        .props('outlined dense autogrow')\
+                        .classes('w-full bg-transparent text-white')
 
-def get_user_role(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT role FROM users WHERE id = ?", (user_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row else "user"
+                    with ui.row().classes('w-full justify-between items-center'):
+                        with ui.row().classes('gap-2'):
+                            ui.button('📎 Attach', on_click=lambda: ui.run_javascript('document.querySelector("input[type=file]").click()')).props('flat dense color=grey-5')
+                        with ui.row().classes('gap-2'):
+                            stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
+                            send_btn = ui.button('Send', on_click=lambda: send()).props('flat dense color=blue-400')
 
-def get_all_sessions_for_user(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, title, timestamp FROM sessions WHERE user_id = ? ORDER BY timestamp DESC", (user_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+                    async def on_key(e):
+                        if e.args.get('key') == 'Enter' and not e.args.get('shiftKey'):
+                            await send()
 
-def get_user_joined_date(user_id):
-    """Returns the account creation date as YYYY-MM-DD, or 'N/A' if missing."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT timestamp FROM users WHERE id = ?", (user_id,))
-        row = cursor.fetchone()
-    except sqlite3.OperationalError:
-        conn.close()
-        return "N/A"
-    conn.close()
-    if row and row[0]:
-        return str(row[0])[:10]
-    return "N/A"
+                    input_box.on('keydown', on_key)
 
-def check_rate_limit(user_id, max_tokens=10, refill_seconds=60):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT tokens, last_reset FROM rate_limits WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    now = datetime.datetime.now()
-    if not row:
-        cursor.execute("INSERT INTO rate_limits (user_id, tokens, last_reset) VALUES (?, ?, ?)", (user_id, max_tokens - 1, now))
-        conn.commit()
-        conn.close()
-        return True, max_tokens - 1
-    tokens, last_reset = row
-    last_reset_dt = datetime.datetime.fromisoformat(last_reset)
-    if (now - last_reset_dt).total_seconds() > refill_seconds:
-        tokens = max_tokens
-        cursor.execute("UPDATE rate_limits SET tokens = ?, last_reset = ? WHERE user_id = ?", (tokens, now, user_id))
-    if tokens <= 0:
-        conn.commit()
-        conn.close()
-        return False, 0
-    tokens -= 1
-    cursor.execute("UPDATE rate_limits SET tokens = ? WHERE user_id = ?", (tokens, user_id))
-    conn.commit()
-    conn.close()
-    return True, tokens
+                    async def send():
+                        prompt = (input_box.value or '').strip()
+                        if not prompt:
+                            return
+                        allowed, remaining = check_rate_limit(USER_ID)
+                        if not allowed:
+                            ui.notify('Rate limit exceeded. Wait 60s.', type='negative')
+                            return
+                        input_box.value = ''
+                        save_message(app.storage.user['current_session'], 'user', prompt, USER_ID)
+                        render_chat()
+                        await run_agent(prompt)
 
-def get_rate_limit_status(user_id, max_tokens=10, refill_seconds=60):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT tokens, last_reset FROM rate_limits WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    if not row:
-        conn.close()
-        return max_tokens
-    tokens, last_reset = row
-    last_reset_dt = datetime.datetime.fromisoformat(last_reset)
-    now = datetime.datetime.now()
-    if (now - last_reset_dt).total_seconds() > refill_seconds:
-        conn.close()
-        return max_tokens
-    conn.close()
-    return max(tokens, 0)
+                    async def run_agent(prompt):
+                        global current_task
+                        stop_btn.classes(remove='hidden')
+                        send_btn.classes(add='hidden')
+                        with chat_box:
+                            with ui.row().classes('w-full justify-start items-start gap-3') as row:
+                                with ui.avatar().classes('bg-blue-500'):
+                                    ui.label('✦').classes('text-white')
+                                with ui.column().classes('flex-grow prose prose-invert prose-sm'):
+                                    status = ui.label('Thinking...').classes('text-gray-400 italic text-sm')
+                                    holder = ui.column().classes('w-full')
+                        final = ""
+                        try:
+                            current_task = asyncio.current_task()
+                            async for kind, content in ask_agent_v2_stream(prompt, USER_ID):
+                                if kind == "step":
+                                    status.text = content
+                                elif kind == "answer":
+                                    final = content
+                                    status.visible = False
+                                    holder.clear()
+                                    with holder:
+                                        ui.markdown(final).classes('text-gray-200')
+                                    ui.run_javascript('const e=document.querySelector(".q-page-container"); if(e) e.scrollTop=e.scrollHeight;')
+                        except asyncio.CancelledError:
+                            status.text = 'Stopped.'
+                            if not final:
+                                final = 'Generation stopped.'
+                        except Exception as e:
+                            status.visible = False
+                            holder.clear()
+                            err = f"**Error:** {type(e).__name__}: {e}"
+                            with holder:
+                                ui.markdown(err).classes('text-red-400')
+                            final = err
+                            print(f"AGENT ERROR: {e}")
+                        finally:
+                            current_task = None
+                            stop_btn.classes(add='hidden')
+                            send_btn.classes(remove='hidden')
+                        save_message(app.storage.user['current_session'], 'assistant', final, USER_ID)
+                        msgs = load_messages(app.storage.user['current_session'], USER_ID)
+                        if len(msgs) == 2:
+                            from database import DB_NAME
+                            import sqlite3
+                            title = generate_chat_title(prompt)
+                            c = sqlite3.connect(DB_NAME); cur = c.cursor()
+                            cur.execute("UPDATE sessions SET title=? WHERE id=?", (title, app.storage.user['current_session']))
+                            c.commit(); c.close()
+                        render_sidebar()
+                        render_chat()
+
+                    def stop_generation():
+                        global current_task
+                        if current_task:
+                            current_task.cancel()
+
+@ui.page('/settings')
+def settings_page():
+    ui.add_head_html(GLOBAL_CSS, shared=True)
+    
+    with ui.header().classes('bg-gray-900 px-4 py-3 border-b border-gray-800 items-center justify-between'):
+        ui.label('Settings').classes('text-lg font-bold text-white')
+        ui.button('Back to Chat', on_click=lambda: ui.navigate.to('/')).props('flat color=white')
+
+    with ui.column().classes('w-full max-w-3xl mx-auto p-6 gap-6 bg-gray-900 min-h-screen'):
+        
+        # --- CHAT HISTORY MANAGEMENT ---
+        with ui.card().classes('w-full bg-gray-800 p-6 rounded-xl'):
+            ui.label('My Chat History').classes('text-white font-semibold mb-4 text-lg')
+            
+            sessions = get_all_sessions_for_user(USER_ID)
+            if not sessions:
+                ui.label('No chat history yet.').classes('text-gray-500 text-sm italic')
+            else:
+                columns = [
+                    {'name': 'title', 'label': 'Title', 'field': 'title', 'align': 'left'},
+                    {'name': 'date', 'label': 'Created', 'field': 'date'},
+                    {'name': 'actions', 'label': '', 'field': 'id'},
+                ]
+                rows = [{'id': s[0], 'title': s[1], 'date': s[2]} for s in sessions]
+                t = ui.table(columns=columns, rows=rows, row_key='id').classes('w-full bg-gray-800 text-white')
+                t.add_slot('body-cell-actions', '''
+                    <q-td :props="props">
+                        <q-btn label="Delete" flat dense color="red" @click="() => $parent.$emit('del', props.row.id)" />
+                    </q-td>
+                ''')
+                def do_del(e):
+                    delete_session(e.args, USER_ID)
+                    ui.notify('Chat deleted. Refreshing...', type='info')
+                    ui.navigate.to('/settings')
+                t.on('del', do_del)
+
+        # --- DANGER ZONE ---
+        with ui.card().classes('w-full bg-gray-800 p-6 rounded-xl border border-red-900'):
+            ui.label('Danger Zone').classes('text-red-400 font-semibold mb-2 text-lg')
+            ui.label('Permanently delete all chats and uploaded documents. This cannot be undone.').classes('text-gray-400 text-sm mb-4')
+            
+            async def clear_all():
+                sessions = get_all_sessions_for_user(USER_ID)
+                for sid, _, _ in sessions:
+                    delete_session(sid, USER_ID)
+                
+                # Clear vector DB
+                try:
+                    from multi_agent import chroma_client
+                    chroma_client.delete_collection(name=f"docs_{USER_ID}")
+                except Exception:
+                    pass
+                    
+                ui.notify('All data cleared.', type='positive')
+                ui.navigate.to('/')
+
+            ui.button('Delete All My Data', on_click=clear_all).props('rounded color=negative')
+
+ui.run(title='Nexus', storage_secret=storage_secret, dark=True, favicon='✦',
+       reload=False, host='127.0.0.1', port=int(os.getenv('PORT', '8080')))
