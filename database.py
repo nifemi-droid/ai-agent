@@ -95,7 +95,7 @@ def create_user(email, password):
         conn.commit()
         return user_id
     except sqlite3.IntegrityError:
-        return None # Email already exists
+        return None
     finally:
         conn.close()
 
@@ -171,6 +171,14 @@ def get_analytics():
     conn.close()
     return rows
 
+def get_analytics_by_route():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT tool_used, COUNT(*) FROM analytics GROUP BY tool_used")
+    rows = cursor.fetchall()
+    conn.close()
+    return dict(rows)
+
 # --- PROFILE HELPERS ---
 def get_user_email(user_id):
     conn = sqlite3.connect(DB_NAME)
@@ -194,3 +202,19 @@ def is_admin(user_id):
     row = cursor.fetchone()
     conn.close()
     return row[0] == 'admin' if row else False
+
+def get_user_role(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT role FROM users WHERE id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else "user"
+
+def get_all_sessions_for_user(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, title, timestamp FROM sessions WHERE user_id = ? ORDER BY timestamp DESC", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows

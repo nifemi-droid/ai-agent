@@ -1,8 +1,9 @@
-from nicegui import ui, app, context
+from nicegui import ui, app
 from multi_agent import ask_agent_v2_stream, ingest_file
 from database import (ensure_dbs_exist, create_user, authenticate_user, 
                       create_session, get_sessions, load_messages, save_message, 
-                      delete_session, get_analytics, get_user_email, update_user_password, is_admin)
+                      delete_session, get_analytics, get_user_email, update_user_password, 
+                      is_admin, get_user_role, get_all_sessions_for_user, get_analytics_by_route)
 import base64
 import os
 import asyncio
@@ -159,9 +160,7 @@ def main_page():
                         if url.strip():
                             with container: ui.link(url, url).classes('text-xs text-blue-400 hover:underline block truncate')
                 else:
-                    with container: 
-                        # Use NiceGUI's code block for syntax highlighting
-                        ui.markdown(content).classes('w-full text-gray-200')
+                    with container: ui.markdown(content).classes('w-full text-gray-200')
 
             def refresh_chat():
                 chat_container.clear()
@@ -211,7 +210,7 @@ def main_page():
                     
                     user_input = ui.input(placeholder='Ask anything...').props('borderless dense').classes('flex-grow text-white bg-transparent')
                     
-                    # STOP BUTTON (Hidden by default)
+                    # STOP BUTTON
                     stop_btn = ui.button('Stop', icon='stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('mr-2 hidden')
                     
                     async def send_message():
@@ -220,7 +219,6 @@ def main_page():
                         prompt = user_input.value
                         user_input.value = ''
                         
-                        # UI updates
                         stop_btn.classes(remove='hidden')
                         send_btn.classes(add='hidden')
                         
@@ -242,7 +240,6 @@ def main_page():
                         
                         final_answer = ""
                         try:
-                            # Store task reference so we can cancel it
                             current_task = asyncio.current_task()
                             
                             async for msg_type, content in ask_agent_v2_stream(prompt):
@@ -289,61 +286,100 @@ def settings_page():
         return
 
     user_id = app.storage.user['user_id']
+    user_email = get_user_email(user_id)
+    user_role = get_user_role(user_id)
 
     with ui.header().classes('items-center justify-between bg-gray-900 text-white p-4 border-b border-gray-800'):
         ui.label('⚙️ Settings & Profile').classes('text-h5 font-bold')
         ui.button('Back to Chat', on_click=lambda: ui.navigate.to('/')).props('flat color=white')
         
-    with ui.column().classes('w-full max-w-4xl mx-auto p-8 bg-gray-900 min-h-screen'):
+    with ui.column().classes('w-full max-w-5xl mx-auto p-8 bg-gray-900 min-h-screen'):
         
+        # --- 1. USER PROFILE ---
         ui.label('Profile').classes('text-h5 text-white mb-4')
-        with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-4 mb-8'):
-            current_email = get_user_email(user_id)
-            ui.label(f"Logged in as: {current_email}").classes('text-white mb-4')
+        with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-6 mb-8 flex-row items-center justify-between'):
+            with ui.column():
+                ui.label(f"Email: {user_email}").classes('text-white text-lg')
+                badge_color = 'bg-blue-600' if user_role == 'admin' else 'bg-gray-600'
+                ui.badge(f"Role: {user_role.upper()}", color=badge_color).classes('mt-2')
             
-            new_password = ui.input('New Password', password=True, password_toggle_button=True).props('outlined rounded').classes('w-full mb-2')
+            with ui.column().classes('gap-2'):
+                new_password = ui.input('New Password', password=True, password_toggle_button=True).props('outlined rounded dense').classes('w-64')
+                async def update_password():
+                    if len(new_password.value) < 6:
+                        ui.notify('Password must be at least 6 characters', type='warning')
+                        return
+                    update_user_password(user_id, new_password.value)
+                    ui.notify('Password updated successfully!', type='positive')
+                    new_password.value = ''
+                ui.button('Update Password', on_click=update_password).props('rounded color=primary')
+
+        # --- 2. CHAT HISTORY MANAGEMENT ---
+        ui.label('My Chat History').classes('text-h5 text-white mb-4')
+        sessions = get_all_sessions_for_user(user_id)
+        if not sessions:
+            ui.label('No chat history yet.').classes('text-gray-500 italic')
+        else:
+            columns = [
+                {'name': 'title', 'label': 'Chat Title', 'field': 'title', 'align': 'left'},
+                {'name': 'date', 'label': 'Created', 'field': 'date'},
+                {'name': 'actions', 'label': 'Actions', 'field': 'id'},
+            ]
+            rows = [{'id': s[0], 'title': s[1], 'date': s[2]} for s in sessions]
             
-            async def update_password():
-                if len(new_password.value) < 6:
-                    ui.notify('Password must be at least 6 characters', type='warning')
-                    return
-                update_user_password(user_id, new_password.value)
-                ui.notify('Password updated successfully!', type='positive')
-                new_password.value = ''
+            table = ui.table(columns=columns, rows=rows, row_key='id').classes('w-full bg-gray-800 text-white mb-8')
             
-            ui.button('Update Password', on_click=update_password).props('rounded color=primary')
+            table.add_slot('body-cell-actions', '''
+                <q-td :props="props">
+                    <q-btn icon="delete" flat dense round color="red" @click="() => $parent.$emit('delete', props.row.id)" />
+                </q-td>
+            ''')
+            
+            def handle_delete(e):
+                delete_session(e.args)
+                ui.notify('Chat deleted. Refreshing...', type='info')
+                ui.navigate.to('/settings')
+            
+            table.on('delete', handle_delete)
 
         ui.separator().classes('bg-gray-700 my-8')
-        
+
+        # --- 3. ADMIN ANALYTICS ---
         if is_admin(user_id):
-            ui.label('Analytics Dashboard (Admin)').classes('text-h5 text-white mb-4')
-            data = get_analytics()
-            if not data:
+            ui.label('Admin Analytics').classes('text-h5 text-white mb-4')
+            
+            route_data = get_analytics_by_route()
+            if not route_data:
                 ui.label('No analytics data yet.').classes('text-gray-500')
             else:
-                with ui.row().classes('gap-4 mb-6 w-full'):
-                    with ui.card().classes('w-1/3 bg-gray-800 text-white border border-gray-700'):
-                        ui.label('Total Queries').classes('text-gray-400')
-                        ui.label(str(len(data))).classes('text-h3 text-white')
+                with ui.row().classes('w-full gap-4 mb-8'):
+                    # Pie Chart
+                    with ui.card().classes('w-1/2 bg-gray-800 border border-gray-700 p-4'):
+                        ui.label('Agent Usage Breakdown').classes('text-white font-bold mb-2')
+                        chart_data = [{'value': v, 'name': k} for k, v in route_data.items()]
+                        ui.echart({
+                            'tooltip': {'trigger': 'item'},
+                            'series': [{
+                                'type': 'pie',
+                                'radius': ['40%', '70%'],
+                                'data': chart_data,
+                                'label': {'color': '#fff'}
+                            }]
+                        }).classes('w-full h-64')
                         
-                    with ui.card().classes('w-1/3 bg-gray-800 text-white border border-gray-700'):
-                        ui.label('Avg Latency').classes('text-gray-400')
-                        avg_lat = sum([r[2] for r in data]) / len(data)
-                        ui.label(f"{avg_lat:.2f}s").classes('text-h3 text-white')
+                    # Bar Chart
+                    with ui.card().classes('w-1/2 bg-gray-800 border border-gray-700 p-4'):
+                        ui.label('Recent Latency (seconds)').classes('text-white font-bold mb-2')
+                        recent = get_analytics()[:10]
+                        latencies = [round(r[2], 2) for r in reversed(recent)]
+                        labels = [f"Query {i+1}" for i in range(len(latencies))]
                         
-                    with ui.card().classes('w-1/3 bg-gray-800 text-white border border-gray-700'):
-                        ui.label('Tools Used').classes('text-gray-400')
-                        ui.label(str(len(set([r[1] for r in data])))).classes('text-h3 text-white')
-                
-                ui.label('Recent Activity').classes('text-h5 mb-2 text-white')
-                columns = [
-                    {'name': 'query', 'label': 'Query', 'field': 'query', 'align': 'left'},
-                    {'name': 'tool', 'label': 'Tool', 'field': 'tool'},
-                    {'name': 'latency', 'label': 'Latency', 'field': 'latency'},
-                    {'name': 'time', 'label': 'Time', 'field': 'time'},
-                ]
-                rows = [{'query': r[0], 'tool': r[1], 'latency': f"{r[2]:.2f}s", 'time': r[3]} for r in data]
-                ui.table(columns=columns, rows=rows).classes('w-full bg-gray-800 text-white')
+                        ui.echart({
+                            'xAxis': {'type': 'category', 'data': labels, 'axisLabel': {'color': '#aaa'}},
+                            'yAxis': {'type': 'value', 'axisLabel': {'color': '#aaa'}},
+                            'series': [{'type': 'bar', 'data': latencies, 'itemStyle': {'color': '#3b82f6'}}]
+                        }).classes('w-full h-64')
+
         else:
             ui.label('🔒 Admin dashboard is only visible to administrators.').classes('text-gray-500 italic')
 
