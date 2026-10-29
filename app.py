@@ -1,16 +1,15 @@
 from nicegui import ui, app
-from multi_agent import ask_agent_v2_stream, ingest_file
+from multi_agent import ask_agent_v2_stream, ingest_file, generate_chat_title
 from database import (ensure_dbs_exist, create_user, authenticate_user, 
                       create_session, get_sessions, load_messages, save_message, 
                       delete_session, get_analytics, get_user_email, update_user_password, 
-                      is_admin, get_user_role, get_all_sessions_for_user, get_analytics_by_route)
+                      is_admin, get_user_role, get_all_sessions_for_user, get_analytics_by_route, delete_last_message)
 import base64
 import os
 import asyncio
 
 ensure_dbs_exist()
 
-# Global task reference for stopping generation
 current_task = None
 
 def is_logged_in():
@@ -66,6 +65,38 @@ def main_page():
 
     dark = ui.dark_mode()
     dark.enable()
+
+    # --- JS INJECTION FOR COPY CODE BUTTONS ---
+    ui.add_head_html('''
+        <script>
+            document.addEventListener('click', function(e) {
+                if (e.target && e.target.classList.contains('copy-code-btn')) {
+                    const codeBlock = e.target.closest('pre').querySelector('code');
+                    if (codeBlock) {
+                        navigator.clipboard.writeText(codeBlock.innerText).then(() => {
+                            const originalText = e.target.innerText;
+                            e.target.innerText = 'Copied!';
+                            setTimeout(() => e.target.innerText = originalText, 2000);
+                        });
+                    }
+                }
+            });
+            
+            function addCopyButtons() {
+                document.querySelectorAll('pre').forEach(pre => {
+                    if (!pre.querySelector('.copy-code-btn')) {
+                        const btn = document.createElement('button');
+                        btn.className = 'copy-code-btn absolute top-2 right-2 bg-gray-700 hover:bg-gray-600 text-white text-xs px-2 py-1 rounded';
+                        btn.innerText = 'Copy';
+                        pre.style.position = 'relative';
+                        pre.appendChild(btn);
+                    }
+                });
+            }
+            
+            setInterval(addCopyButtons, 1000);
+        </script>
+    ''')
 
     with ui.header().classes('bg-gray-900 text-white border-b border-gray-800 px-4 py-2 flex items-center justify-between'):
         with ui.row().classes('items-center gap-2'):
@@ -126,7 +157,6 @@ def main_page():
         # --- MAIN CHAT AREA ---
         with ui.column().classes('flex-grow h-full flex flex-col relative'):
             
-            # Auto-scroll JS
             ui.add_head_html('''
                 <script>
                     function scrollToBottom() {
@@ -138,7 +168,7 @@ def main_page():
             
             chat_container = ui.column().classes('w-full max-w-3xl mx-auto gap-6 overflow-y-auto flex-grow p-4 pb-24')
             
-            def render_message_content(container, content):
+            def render_message_content(container, content, message_index, total_messages):
                 if "[PLOT_GENERATED]" in content:
                     clean = content.replace("[PLOT_GENERATED]", "")
                     with container: ui.markdown(clean).classes('w-full text-gray-200')
@@ -162,9 +192,14 @@ def main_page():
                 else:
                     with container: ui.markdown(content).classes('w-full text-gray-200')
 
+                if message_index == total_messages - 1:
+                    with container:
+                        ui.button('Regenerate', icon='refresh', on_click=lambda: regenerate_response()).props('flat dense size=sm color=grey-5').classes('mt-2')
+
             def refresh_chat():
                 chat_container.clear()
-                for msg in load_messages(app.storage.user['current_session']):
+                messages = load_messages(app.storage.user['current_session'])
+                for i, msg in enumerate(messages):
                     sent = msg['role'] == 'user'
                     
                     if sent:
@@ -177,10 +212,22 @@ def main_page():
                             with ui.row().classes('w-full justify-start items-start gap-4'):
                                 ui.icon('auto_awesome', size='md').classes('text-blue-400 mt-1')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
-                                    render_message_content(ui.column().classes('w-full'), msg['content'])
+                                    render_message_content(ui.column().classes('w-full'), msg['content'], i, len(messages))
                 ui.run_javascript('scrollToBottom()')
 
             refresh_chat()
+
+            async def regenerate_response():
+                messages = load_messages(app.storage.user['current_session'])
+                if not messages or messages[-1]['role'] != 'assistant':
+                    return
+                
+                delete_last_message(app.storage.user['current_session'])
+                user_prompt = messages[-2]['content'] if len(messages) >= 2 else ""
+                refresh_chat()
+                
+                if user_prompt:
+                    await run_agent(user_prompt)
 
             # --- FLOATING INPUT BAR ---
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
@@ -210,24 +257,13 @@ def main_page():
                     
                     user_input = ui.input(placeholder='Ask anything...').props('borderless dense').classes('flex-grow text-white bg-transparent')
                     
-                    # STOP BUTTON
                     stop_btn = ui.button('Stop', icon='stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('mr-2 hidden')
                     
-                    async def send_message():
+                    async def run_agent(prompt):
                         global current_task
-                        if not user_input.value: return
-                        prompt = user_input.value
-                        user_input.value = ''
                         
                         stop_btn.classes(remove='hidden')
                         send_btn.classes(add='hidden')
-                        
-                        save_message(app.storage.user['current_session'], 'user', prompt)
-                        
-                        with chat_container:
-                            with ui.row().classes('w-full justify-end'):
-                                with ui.card().classes('bg-gray-800 text-white rounded-2xl max-w-[80%] px-4 py-2 shadow-none'):
-                                    ui.markdown(prompt)
                         
                         with chat_container:
                             with ui.row().classes('w-full justify-start items-start gap-4') as ai_row:
@@ -249,19 +285,48 @@ def main_page():
                                     final_answer = content
                                     status_label.visible = False
                                     answer_container.clear()
-                                    render_message_content(answer_container, final_answer)
+                                    render_message_content(answer_container, final_answer, 999, 999) 
                                     ai_row.find('icon').classes('animate-pulse', remove=True)
                                     ui.run_javascript('scrollToBottom()')
                         except asyncio.CancelledError:
                             status_label.text = "⏹️ Generation stopped by user."
-                            final_answer = "Generation stopped."
+                            if not final_answer:
+                                final_answer = "Generation stopped."
+                            ui.notify('Generation stopped', type='warning')
                         finally:
                             current_task = None
                             stop_btn.classes(add='hidden')
                             send_btn.classes(remove='hidden')
                         
                         save_message(app.storage.user['current_session'], 'assistant', final_answer)
+                        
+                        messages = load_messages(app.storage.user['current_session'])
+                        if len(messages) == 2:
+                            new_title = generate_chat_title(prompt)
+                            import sqlite3
+                            from database import DB_NAME
+                            conn = sqlite3.connect(DB_NAME)
+                            cursor = conn.cursor()
+                            cursor.execute("UPDATE sessions SET title = ? WHERE id = ?", (new_title, app.storage.user['current_session']))
+                            conn.commit()
+                            conn.close()
+                            
                         refresh_sidebar()
+                        refresh_chat() 
+
+                    async def send_message():
+                        if not user_input.value: return
+                        prompt = user_input.value
+                        user_input.value = ''
+                        
+                        save_message(app.storage.user['current_session'], 'user', prompt)
+                        
+                        with chat_container:
+                            with ui.row().classes('w-full justify-end'):
+                                with ui.card().classes('bg-gray-800 text-white rounded-2xl max-w-[80%] px-4 py-2 shadow-none'):
+                                    ui.markdown(prompt)
+                        
+                        await run_agent(prompt)
 
                     def stop_generation():
                         global current_task
@@ -295,7 +360,6 @@ def settings_page():
         
     with ui.column().classes('w-full max-w-5xl mx-auto p-8 bg-gray-900 min-h-screen'):
         
-        # --- 1. USER PROFILE ---
         ui.label('Profile').classes('text-h5 text-white mb-4')
         with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-6 mb-8 flex-row items-center justify-between'):
             with ui.column():
@@ -314,7 +378,6 @@ def settings_page():
                     new_password.value = ''
                 ui.button('Update Password', on_click=update_password).props('rounded color=primary')
 
-        # --- 2. CHAT HISTORY MANAGEMENT ---
         ui.label('My Chat History').classes('text-h5 text-white mb-4')
         sessions = get_all_sessions_for_user(user_id)
         if not sessions:
@@ -344,7 +407,6 @@ def settings_page():
 
         ui.separator().classes('bg-gray-700 my-8')
 
-        # --- 3. ADMIN ANALYTICS ---
         if is_admin(user_id):
             ui.label('Admin Analytics').classes('text-h5 text-white mb-4')
             
@@ -353,7 +415,6 @@ def settings_page():
                 ui.label('No analytics data yet.').classes('text-gray-500')
             else:
                 with ui.row().classes('w-full gap-4 mb-8'):
-                    # Pie Chart
                     with ui.card().classes('w-1/2 bg-gray-800 border border-gray-700 p-4'):
                         ui.label('Agent Usage Breakdown').classes('text-white font-bold mb-2')
                         chart_data = [{'value': v, 'name': k} for k, v in route_data.items()]
@@ -367,7 +428,6 @@ def settings_page():
                             }]
                         }).classes('w-full h-64')
                         
-                    # Bar Chart
                     with ui.card().classes('w-1/2 bg-gray-800 border border-gray-700 p-4'):
                         ui.label('Recent Latency (seconds)').classes('text-white font-bold mb-2')
                         recent = get_analytics()[:10]
@@ -379,7 +439,6 @@ def settings_page():
                             'yAxis': {'type': 'value', 'axisLabel': {'color': '#aaa'}},
                             'series': [{'type': 'bar', 'data': latencies, 'itemStyle': {'color': '#3b82f6'}}]
                         }).classes('w-full h-64')
-
         else:
             ui.label('🔒 Admin dashboard is only visible to administrators.').classes('text-gray-500 italic')
 

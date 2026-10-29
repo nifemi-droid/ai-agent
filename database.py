@@ -59,7 +59,7 @@ def ensure_dbs_exist():
     conn.commit()
     conn.close()
 
-    # 5. Ensure sales DB exists (for the DB Agent)
+    # 5. Ensure sales DB exists
     if not os.path.exists(SALES_DB):
         conn = sqlite3.connect(SALES_DB)
         cursor = conn.cursor()
@@ -154,6 +154,16 @@ def load_messages(session_id):
     rows = cursor.fetchall()
     conn.close()
     return [{"role": row[0], "content": row[1]} for row in rows]
+
+def delete_last_message(session_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1", (session_id,))
+    row = cursor.fetchone()
+    if row:
+        cursor.execute("DELETE FROM messages WHERE id = ?", (row[0],))
+        conn.commit()
+    conn.close()
 
 # --- ANALYTICS ---
 def log_analytics(user_query, tool_used, latency):

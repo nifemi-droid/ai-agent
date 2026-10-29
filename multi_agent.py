@@ -49,6 +49,13 @@ def safe_llm_invoke(messages):
         except Exception as fallback_error:
             return AIMessage(content="My AI systems are currently offline. Please try again later.")
 
+def generate_chat_title(prompt):
+    try:
+        response = fallback_llm.invoke([HumanMessage(content=f"Summarize this prompt into a 3-4 word title. Do not use quotes or punctuation.\n\nPrompt: {prompt}")])
+        return response.content.strip()[:30]
+    except:
+        return prompt[:30] + "..."
+
 # --- INGESTION ---
 def ingest_file(file_bytes, file_name):
     if file_name.endswith('.pdf'):
