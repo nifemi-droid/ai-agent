@@ -193,11 +193,11 @@ def main_page():
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
                             send_btn = ui.button('Send', on_click=lambda: send()).props('flat dense color=blue-400')
 
-                    input_box.on('keydown', lambda e: _handle_key(e))
-
-                    def _handle_key(e):
+                    async def on_key(e):
                         if e.args.get('key') == 'Enter' and not e.args.get('shiftKey'):
-                            asyncio.create_task(send())
+                            await send()
+
+                    input_box.on('keydown', on_key)
 
                     async def send():
                         prompt = (input_box.value or '').strip()
@@ -221,9 +221,11 @@ def main_page():
                                 with ui.avatar().classes('bg-blue-500'):
                                     ui.label('✦').classes('text-white')
                                 with ui.column().classes('flex-grow prose prose-invert prose-sm'):
-                                    status = ui.label('Thinking...').classes('text-gray-400 italic text-sm')
+                                    status = ui.label('Thinking...').classes('text-gray-400 italic text-xs')
                                     holder = ui.column().classes('w-full')
+                        
                         final = ""
+                        got_answer = False
                         try:
                             current_task = asyncio.current_task()
                             async for kind, content in ask_agent_v2_stream(prompt, USER_ID):
@@ -231,6 +233,7 @@ def main_page():
                                     status.text = content
                                 elif kind == "answer":
                                     final = content
+                                    got_answer = True
                                     status.visible = False
                                     holder.clear()
                                     with holder:
@@ -240,10 +243,28 @@ def main_page():
                             status.text = 'Stopped.'
                             if not final:
                                 final = 'Generation stopped.'
+                            got_answer = True
+                        except Exception as e:
+                            print(f"AGENT ERROR: {type(e).__name__}: {e}")
+                            status.visible = False
+                            holder.clear()
+                            err = f"**Error:** {type(e).__name__}: {e}"
+                            with holder:
+                                ui.markdown(err).classes('text-red-400')
+                            final = err
+                            got_answer = True
                         finally:
                             current_task = None
                             stop_btn.classes(add='hidden')
                             send_btn.classes(remove='hidden')
+                        
+                        if not got_answer:
+                            status.visible = False
+                            holder.clear()
+                            with holder:
+                                ui.markdown("**No answer was returned.** The agent finished without producing a reply. Check the terminal for errors.").classes('text-red-400')
+                            final = "No answer was returned."
+                        
                         save_message(app.storage.user['current_session'], 'assistant', final, USER_ID)
                         msgs = load_messages(app.storage.user['current_session'], USER_ID)
                         if len(msgs) == 2:
