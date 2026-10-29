@@ -15,11 +15,17 @@ from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 import chromadb
 
-if not os.getenv("GROQ_API_KEY"):
-    load_dotenv()
+load_dotenv()
 
-tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+GROQ_KEY = os.getenv("GROQ_API_KEY")
+TAVILY_KEY = os.getenv("TAVILY_API_KEY")
 
+if not GROQ_KEY:
+    raise RuntimeError("GROQ_API_KEY is not set")
+if not TAVILY_KEY:
+    raise RuntimeError("TAVILY_API_KEY is not set")
+
+tavily = TavilyClient(api_key=TAVILY_KEY)
 print("Loading embedding model into memory...")
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 print("Connecting to persistent vector database...")
