@@ -27,8 +27,8 @@ if not GROQ_KEY:
 if not TAVILY_KEY:
     raise RuntimeError("TAVILY_API_KEY is missing from .env")
 
-# Added timeout to prevent hanging connections
-tavily = TavilyClient(api_key=TAVILY_KEY, timeout=15)
+# Initialize Tavily (timeout is handled in the search call)
+tavily = TavilyClient(api_key=TAVILY_KEY)
 
 print("Loading embedding model into memory...")
 os.environ["HF_HUB_OFFLINE"] = "1" 
@@ -210,7 +210,8 @@ def web_worker(state: AgentState):
     
     for attempt in range(max_retries):
         try:
-            res = tavily.search(query=query, search_depth="basic")
+            # Added timeout here
+            res = tavily.search(query=query, search_depth="basic", timeout=15)
             context = "\n".join([f"{r['title']}: {r['content']}" for r in res['results']])
             prompt = f"You are a Technical PM doing market research. Answer using ONLY this web data:\n{context}\n\nQuestion: {query}"
             response = safe_llm_invoke([HumanMessage(content=prompt)])
