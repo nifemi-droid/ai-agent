@@ -5,6 +5,8 @@ import io
 import pandas as pd
 import asyncio
 import requests
+import ast
+import re
 from urllib.parse import quote
 from typing import TypedDict, Annotated, Sequence
 from dotenv import load_dotenv
@@ -88,7 +90,34 @@ def ingest_file(file_bytes, file_name):
             return f"Error: {str(e)}"
     return "Unsupported file type."
 
+# --- SQL VALIDATOR ---
+def is_sql_safe(sql_query):
+    query = sql_query.strip().lower()
+    
+    if not query.startswith("select"):
+        return False, "Only SELECT queries are allowed."
+    
+    FORBIDDEN_KEYWORDS = ['drop', 'delete', 'update', 'insert', 'alter', 'create', 'replace', 'truncate', 'grant', 'revoke', 'attach', 'detach', 'pragma']
+    for keyword in FORBIDDEN_KEYWORDS:
+        if re.search(rf'\b{keyword}\b', query):
+            return False, f"Forbidden keyword detected: {keyword.upper()}"
+    
+    if '--' in query or '/*' in query:
+        return False, "SQL comments are not allowed."
+        
+    if ';' in query:
+        parts = [p for p in query.split(';') if p.strip()]
+        if len(parts) > 1:
+            return False, "Multiple SQL statements are not allowed."
+
+    return True, "Safe"
+
 def query_user_data(sql_query):
+    is_safe, reason = is_sql_safe(sql_query)
+    if not is_safe:
+        print(f"🚨 SQL SECURITY BLOCK: {reason}")
+        return f"Security Alert: The generated SQL was blocked. Reason: {reason}"
+        
     try:
         db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "user_data.db")
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -101,6 +130,31 @@ def query_user_data(sql_query):
         return str([dict(zip(columns, row)) for row in results])
     except Exception as e:
         return f"SQL Error: {str(e)}"
+
+# --- CODE VALIDATOR ---
+def is_code_safe(code_str):
+    try:
+        tree = ast.parse(code_str)
+    except SyntaxError:
+        return False, "Syntax error in generated code."
+
+    FORBIDDEN_MODULES = {'os', 'sys', 'subprocess', 'shutil', 'socket', 'requests', 'urllib', 'pty', 'platform', 'ctypes'}
+    FORBIDDEN_FUNCTIONS = {'eval', 'exec', 'open', 'compile', '__import__', 'input'}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split('.')[0] in FORBIDDEN_MODULES:
+                    return False, f"Forbidden import: {alias.name}"
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.module.split('.')[0] in FORBIDDEN_MODULES:
+                return False, f"Forbidden import: {node.module}"
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id in FORBIDDEN_FUNCTIONS:
+                    return False, f"Forbidden function: {node.func.id}"
+                    
+    return True, "Safe"
 
 # --- WORKERS ---
 def guardrail_node(state: AgentState):
@@ -161,25 +215,45 @@ def pdf_worker(state: AgentState):
 
 def user_data_worker(state: AgentState):
     query = state["messages"][-1].content
-    prompt = f"Write a SQL query for the table 'user_uploaded_data'. Return ONLY SQL.\nQuestion: {query}"
+    prompt = f"""You are a SQL expert. Write a SQL query for the table 'user_uploaded_data' to answer the user's question.
+    
+    CRITICAL SECURITY RULE: You must ONLY write SELECT statements. Do NOT use DROP, DELETE, UPDATE, INSERT, ALTER, or any comments (--).
+    
+    Return ONLY the raw SQL query. No markdown, no ```sql, no explanations.
+    
+    Question: {query}"""
+    
     sql_response = safe_llm_invoke([HumanMessage(content=prompt)])
     sql_query = sql_response.content.strip().replace("```sql", "").replace("```", "")
+    
     result = query_user_data(sql_query)
     final_response = safe_llm_invoke([HumanMessage(content=f"Data: {result}\n\nAnswer: {query}")])
     return {"messages": [AIMessage(content=final_response.content)]}
 
 def code_worker(state: AgentState):
+    print("🐍 Code Agent is writing Python...")
     query = state["messages"][-1].content
+    
     prompt = f"""You are a Python Data Analyst. The user's data is in SQLite at 'user_data.db' in table 'user_uploaded_data'.
     Write Python code using pandas to answer the question.
     - Load data: `conn = sqlite3.connect('user_data.db')`, `df = pd.read_sql_query("SELECT * FROM user_uploaded_data", conn)`
     - If plotting: use matplotlib/seaborn and save to 'output_plot.png'. Do NOT use plt.show().
     - Store the final text answer in a variable called `final_answer`.
     - Return ONLY raw Python code. No markdown, no ```python.
+    
+    CRITICAL SECURITY RULE: You must ONLY use pandas, matplotlib, seaborn, and sqlite3.
+    You are FORBIDDEN from using `os`, `sys`, `subprocess`, `eval`, `exec`, or `open`.
+    
     Question: {query}"""
     
     code_response = safe_llm_invoke([HumanMessage(content=prompt)])
     python_code = code_response.content.strip().replace("```python", "").replace("```", "")
+    print(f"🔧 Generated Code:\n{python_code}")
+    
+    is_safe, reason = is_code_safe(python_code)
+    if not is_safe:
+        print(f"🚨 SECURITY BLOCK: {reason}")
+        return {"messages": [AIMessage(content=f"Security Alert: The generated code contained forbidden operations ({reason}) and was blocked.")]}
     
     local_vars = {}
     try:
@@ -188,7 +262,9 @@ def code_worker(state: AgentState):
         import matplotlib.pyplot as plt
         import seaborn as sns
         
-        exec(python_code, {"pd": pd, "sqlite3": sqlite3, "plt": plt, "sns": sns}, local_vars)
+        safe_globals = {"__builtins__": __builtins__, "pd": pd, "sqlite3": sqlite3, "plt": plt, "sns": sns}
+        exec(python_code, safe_globals, local_vars)
+        
         final_answer = local_vars.get("final_answer", "Code executed, but no text answer was generated.")
         
         if os.path.exists("output_plot.png"):
