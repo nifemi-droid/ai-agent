@@ -87,10 +87,19 @@ def ensure_dbs_exist():
             last_reset DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    
+    # 6. Single-User Seed: Ensure 'local' admin exists
+    cursor.execute("SELECT 1 FROM users WHERE id = 'local'")
+    if not cursor.fetchone():
+        cursor.execute(
+            "INSERT INTO users (id, email, password, role, timestamp) VALUES (?, ?, ?, ?, ?)",
+            ("local", "local@localhost", hash_password("unused-seed-password-change-me"), "admin", datetime.datetime.now())
+        )
+        
     conn.commit()
     conn.close()
 
-    # 6. Ensure sales DB exists (legacy fallback, not used in the focused app)
+    # 7. Ensure sales DB exists (legacy fallback)
     if not os.path.exists(SALES_DB):
         conn = sqlite3.connect(SALES_DB)
         cursor = conn.cursor()
