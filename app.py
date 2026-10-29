@@ -114,15 +114,18 @@ def main_page():
                                 with ui.avatar().classes('bg-blue-500'):
                                     ui.label('✦').classes('text-white')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
+                                    is_err = any(w in m['content'].lower() for w in ("failed", "error", "offline", "cannot"))
+                                    color = 'text-red-400' if is_err else 'text-gray-200'
+                                    
                                     if "[SOURCES]" in m['content']:
                                         head, tail = m['content'].split("[SOURCES]", 1)
-                                        ui.markdown(head).classes('text-gray-200')
+                                        ui.markdown(head).classes(color)
                                         ui.label('Sources').classes('text-xs font-bold text-gray-500 mt-2')
                                         for url in tail.split("|"):
                                             if url.strip().startswith("http"):
                                                 ui.link(url.strip(), url.strip()).classes('text-xs text-blue-400 block truncate')
                                     else:
-                                        ui.markdown(m['content']).classes('text-gray-200')
+                                        ui.markdown(m['content']).classes(color)
                                     if i == len(msgs) - 1:
                                         ui.button('Regenerate', on_click=lambda: regenerate()).props('flat dense size=sm color=grey-5').classes('mt-2')
                 ui.run_javascript('const e=document.querySelector(".q-page-container"); if(e) e.scrollTop=e.scrollHeight;')
@@ -130,11 +133,9 @@ def main_page():
             render_chat()
 
             async def edit_prompt(idx, content):
-                # Delete from the edited user message onward
                 while len(load_messages(app.storage.user['current_session'], USER_ID)) > idx:
                     delete_last_message(app.storage.user['current_session'], USER_ID)
                 render_chat()
-                # Populate the input box with the old text
                 input_box.value = content
                 ui.run_javascript('const t=document.querySelector("textarea"); if(t) t.focus();')
 
@@ -209,13 +210,23 @@ def main_page():
                             return
                         input_box.value = ''
                         save_message(app.storage.user['current_session'], 'user', prompt, USER_ID)
-                        render_chat()
+                        
+                        # Render user bubble immediately
+                        with chat_box:
+                            with ui.row().classes('w-full justify-end items-start gap-2'):
+                                idx = len(load_messages(app.storage.user['current_session'], USER_ID)) - 1
+                                ui.button('Edit', on_click=lambda idx=idx, c=prompt: edit_prompt(idx, c)).props('flat dense size=sm color=grey-5')
+                                with ui.card().classes('bg-blue-600 text-white rounded-2xl max-w-[80%] px-4 py-2'):
+                                    ui.markdown(prompt)
+                        ui.run_javascript('const e=document.querySelector(".q-page-container"); if(e) e.scrollTop=e.scrollHeight;')
+                        
                         await run_agent(prompt)
 
                     async def run_agent(prompt):
                         global current_task
                         stop_btn.classes(remove='hidden')
                         send_btn.classes(add='hidden')
+                        
                         with chat_box:
                             with ui.row().classes('w-full justify-start items-start gap-3') as row:
                                 with ui.avatar().classes('bg-blue-500'):
@@ -223,6 +234,8 @@ def main_page():
                                 with ui.column().classes('flex-grow prose prose-invert prose-sm'):
                                     status = ui.label('Thinking...').classes('text-gray-400 italic text-xs')
                                     holder = ui.column().classes('w-full')
+                        
+                        ui.run_javascript('const e=document.querySelector(".q-page-container"); if(e) e.scrollTop=e.scrollHeight;')
                         
                         final = ""
                         got_answer = False
@@ -236,8 +249,10 @@ def main_page():
                                     got_answer = True
                                     status.visible = False
                                     holder.clear()
+                                    is_err = any(w in final.lower() for w in ("failed", "error", "offline", "cannot"))
+                                    color = 'text-red-400' if is_err else 'text-gray-200'
                                     with holder:
-                                        ui.markdown(final).classes('text-gray-200')
+                                        ui.markdown(final).classes(color)
                                     ui.run_javascript('const e=document.querySelector(".q-page-container"); if(e) e.scrollTop=e.scrollHeight;')
                         except asyncio.CancelledError:
                             status.text = 'Stopped.'
@@ -262,7 +277,7 @@ def main_page():
                             status.visible = False
                             holder.clear()
                             with holder:
-                                ui.markdown("**No answer was returned.** The agent finished without producing a reply. Check the terminal for errors.").classes('text-red-400')
+                                ui.markdown("**No answer was returned.** Check the terminal for errors.").classes('text-red-400')
                             final = "No answer was returned."
                         
                         save_message(app.storage.user['current_session'], 'assistant', final, USER_ID)
@@ -275,7 +290,6 @@ def main_page():
                             cur.execute("UPDATE sessions SET title=? WHERE id=?", (title, app.storage.user['current_session']))
                             c.commit(); c.close()
                         render_sidebar()
-                        render_chat()
 
                     def stop_generation():
                         global current_task
@@ -292,7 +306,6 @@ def settings_page():
 
     with ui.column().classes('w-full max-w-3xl mx-auto p-6 gap-6 bg-gray-900 min-h-screen'):
         
-        # --- CHAT HISTORY MANAGEMENT ---
         with ui.card().classes('w-full bg-gray-800 p-6 rounded-xl'):
             ui.label('My Chat History').classes('text-white font-semibold mb-4 text-lg')
             
@@ -318,7 +331,6 @@ def settings_page():
                     ui.navigate.to('/settings')
                 t.on('del', do_del)
 
-        # --- DANGER ZONE ---
         with ui.card().classes('w-full bg-gray-800 p-6 rounded-xl border border-red-900'):
             ui.label('Danger Zone').classes('text-red-400 font-semibold mb-2 text-lg')
             ui.label('Permanently delete all chats and uploaded documents. This cannot be undone.').classes('text-gray-400 text-sm mb-4')
@@ -327,14 +339,11 @@ def settings_page():
                 sessions = get_all_sessions_for_user(USER_ID)
                 for sid, _, _ in sessions:
                     delete_session(sid, USER_ID)
-                
-                # Clear vector DB
                 try:
                     from multi_agent import chroma_client
                     chroma_client.delete_collection(name=f"docs_{USER_ID}")
                 except Exception:
                     pass
-                    
                 ui.notify('All data cleared.', type='positive')
                 ui.navigate.to('/')
 
