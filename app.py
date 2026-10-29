@@ -1,5 +1,5 @@
 from nicegui import ui, app
-from multi_agent import ask_agent_v2_stream, ingest_file, generate_chat_title
+from multi_agent import ask_agent_v2_stream, generate_chat_title, ingest_files
 from database import (ensure_dbs_exist, create_user, authenticate_user, 
                       create_session, get_sessions, load_messages, save_message, 
                       delete_session, get_analytics, get_user_email, update_user_password, 
@@ -18,7 +18,6 @@ if not storage_secret or len(storage_secret) < 32:
 ensure_dbs_exist()
 current_task = None
 
-# --- GLOBAL STYLES (safe, no user data) ---
 GLOBAL_CSS = """
 <style>
     * { font-family: 'Inter', 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif; }
@@ -90,6 +89,7 @@ def main_page():
     dark = ui.dark_mode()
     dark.enable()
 
+    # --- SAFE STATIC JS ---
     ui.add_head_html('''
         <script>
             document.addEventListener('click', function(e) {
@@ -121,9 +121,41 @@ def main_page():
                 const el = document.querySelector('.q-page-container');
                 if (el) el.scrollTop = el.scrollHeight;
             }
+            // Multi-file reader with client-side limits
+            window.readFiles = function(inputEl) {
+                const files = Array.from(inputEl.files).slice(0, 3);
+                let total = 0;
+                const out = [];
+                let pending = files.length;
+                if (pending === 0) return;
+                files.forEach(file => {
+                    if (file.size > 10 * 1024 * 1024) {
+                        emitEvent('upload_error', {msg: 'File exceeds 10 MB'});
+                        pending--;
+                        return;
+                    }
+                    total += file.size;
+                    if (total > 25 * 1024 * 1024) {
+                        emitEvent('upload_error', {msg: 'Total upload exceeds 25 MB'});
+                        pending--;
+                        return;
+                    }
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        const b64 = e.target.result.split(',')[1];
+                        out.push({name: file.name, data: b64});
+                        pending--;
+                        if (pending === 0 && out.length > 0) {
+                            emitEvent('files_ready', {files: out});
+                        }
+                    };
+                    reader.readAsDataURL(file);
+                });
+            };
         </script>
     ''')
 
+    # --- HEADER ---
     with ui.header().classes('bg-gray-900 text-white border-b border-gray-800 px-4 py-2 items-center justify-between'):
         with ui.row().classes('items-center gap-3'):
             ui.icon('auto_awesome', size='sm').classes('text-blue-400')
@@ -141,6 +173,7 @@ def main_page():
             ui.button(icon='logout', on_click=logout).props('flat round dense color=white size=sm').tooltip('Logout')
             ui.button(icon='settings', on_click=lambda: ui.navigate.to('/settings')).props('flat round dense color=white size=sm').tooltip('Settings')
 
+    # --- MAIN LAYOUT ---
     with ui.row().classes('w-full no-wrap h-[calc(100vh-60px)] bg-gray-900'):
         
         # --- SIDEBAR ---
@@ -184,20 +217,7 @@ def main_page():
             chat_container = ui.column().classes('w-full max-w-3xl mx-auto gap-6 overflow-y-auto flex-grow p-4 pb-32')
             
             def render_message_content(container, content, msg_idx, total_msgs):
-                if "[PLOT_GENERATED]" in content:
-                    clean = content.replace("[PLOT_GENERATED]", "")
-                    with container: ui.markdown(clean).classes('w-full text-gray-200')
-                    if os.path.exists("output_plot.png"):
-                        with container: ui.image("output_plot.png").classes('w-full rounded-lg mt-2 border border-gray-700')
-                        os.remove("output_plot.png")
-                elif "[IMAGE_GENERATED]" in content:
-                    parts = content.split("[IMAGE_GENERATED]")
-                    with container: ui.markdown(parts[0]).classes('w-full text-gray-200')
-                    if len(parts) > 1:
-                        img_url = parts[1].strip()
-                        if img_url.startswith("https://image.pollinations.ai/"):
-                            with container: ui.image(img_url).classes('w-full rounded-lg mt-2 border border-gray-700')
-                elif "[SOURCES]" in content:
+                if "[SOURCES]" in content:
                     parts = content.split("[SOURCES]")
                     with container: ui.markdown(parts[0]).classes('w-full text-gray-200')
                     urls = parts[1].split("|")
@@ -251,33 +271,36 @@ def main_page():
             # --- FLOATING INPUT BAR ---
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 shadow-2xl rounded-2xl flex-row items-center px-3 py-2 border border-gray-700 modern-input'):
-                    file_input = ui.element('input').props('type=file accept=".pdf,.csv,.xlsx,.xls" style="display: none;"')
-                    file_input.on('change', lambda e: ui.run_javascript('''
-                        const file = document.querySelector('input[type=file]').files[0];
-                        if (file) {
-                            const reader = new FileReader();
-                            reader.onload = (event) => {
-                                const base64Data = event.target.result.split(',')[1];
-                                emitEvent('file_uploaded', {name: file.name, data: base64Data});
-                            };
-                            reader.readAsDataURL(file);
-                        }
-                    '''))
+                    
+                    # Hidden multi-file input
+                    file_input = ui.element('input')\
+                        .props('type=file multiple accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" style="display: none;"')\
+                        .on('change', lambda e: ui.run_javascript('window.readFiles(document.querySelector("input[type=file]"))'))
 
-                    async def process_file_event(e):
-                        file_name = e.args['name']
-                        file_bytes = base64.b64decode(e.args['data'])
-                        await handle_upload_logic(file_name, file_bytes)
+                    async def process_files_event(e):
+                        files = e.args.get('files', [])
+                        res = await ui.run.io_bound(ingest_files, files, user_id)
+                        with chat_container:
+                            with ui.row().classes('w-full justify-center'):
+                                ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
 
-                    ui.on('file_uploaded', process_file_event)
-                    ui.button(icon='attach_file', on_click=lambda: ui.run_javascript('document.querySelector("input[type=file]").click()')).props('flat round dense color=grey-5 size=sm')
-                    user_input = ui.input(placeholder='Ask anything...').props('borderless dense').classes('flex-grow text-white bg-transparent text-base')
+                    def process_upload_error(e):
+                        ui.notify(e.args.get('msg', 'Upload failed'), type='negative', position='top')
+
+                    ui.on('files_ready', process_files_event)
+                    ui.on('upload_error', process_upload_error)
+
+                    ui.button(icon='attach_file', on_click=lambda: ui.run_javascript('document.querySelector("input[type=file]").click()')).props('flat round dense color=grey-5 size=sm').tooltip('Upload up to 3 files (10MB each, 25MB total)')
+                    
+                    user_input = ui.input(placeholder='Ask a question or request a document...').props('borderless dense').classes('flex-grow text-white bg-transparent text-base')
+                    
                     stop_btn = ui.button('Stop', icon='stop', on_click=lambda: stop_generation()).props('flat dense color=red-400 size=sm').classes('mr-1 hidden')
                     
                     async def run_agent(prompt):
                         global current_task
                         stop_btn.classes(remove='hidden')
                         send_btn.classes(add='hidden')
+                        
                         with chat_container:
                             with ui.row().classes('w-full justify-start items-start gap-3') as ai_row:
                                 with ui.avatar().classes('bg-gradient-to-br from-blue-500 to-purple-600 animate-pulse'):
@@ -285,6 +308,7 @@ def main_page():
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
                                     status_label = ui.label('Thinking...').classes('text-gray-400 italic text-sm not-prose')
                                     answer_container = ui.column().classes('w-full')
+                        
                         ui.run_javascript('scrollToBottom()')
                         final_answer = ""
                         try:
@@ -308,6 +332,7 @@ def main_page():
                             current_task = None
                             stop_btn.classes(add='hidden')
                             send_btn.classes(remove='hidden')
+                        
                         save_message(app.storage.user['current_session'], 'assistant', final_answer, user_id)
                         messages = load_messages(app.storage.user['current_session'], user_id)
                         if len(messages) == 2:
@@ -333,6 +358,7 @@ def main_page():
                         prompt = user_input.value
                         user_input.value = ''
                         save_message(app.storage.user['current_session'], 'user', prompt, user_id)
+                        
                         with chat_container:
                             with ui.row().classes('w-full justify-end chat-bubble-user'):
                                 with ui.card().classes('bg-blue-600 text-white rounded-2xl rounded-tr-sm max-w-[80%] px-4 py-2 shadow-lg border-none'):
@@ -347,13 +373,6 @@ def main_page():
 
                     send_btn = ui.button(icon='send', on_click=send_message).props('flat round dense color=blue-400 size=sm')
                     user_input.on('keydown.enter', send_message)
-
-            async def handle_upload_logic(file_name, file_bytes):
-                ui.notify(f"Processing {file_name}...", type='info', position='top')
-                res = await ui.run.io_bound(ingest_file, file_bytes, file_name, user_id)
-                with chat_container:
-                    with ui.row().classes('w-full justify-center'):
-                        ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
 
 @ui.page('/settings')
 def settings_page():
