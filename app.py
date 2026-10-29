@@ -35,14 +35,21 @@ def clean_text(content):
     return content
 
 @ui.page('/')
-def main_page():
+def main_page(session: str = None):
     global current_task
     ui.add_head_html(GLOBAL_CSS, shared=True)
     ui.dark_mode().enable()
 
-    if 'current_session' not in app.storage.user:
-        sessions = get_sessions(USER_ID)
-        app.storage.user['current_session'] = sessions[0][0] if sessions else create_session(USER_ID, "New Chat")
+    # Security-checked session loading from URL
+    valid_sessions = [s[0] for s in get_sessions(USER_ID)]
+    
+    if session and session in valid_sessions:
+        app.storage.user['current_session'] = session
+    elif 'current_session' not in app.storage.user or app.storage.user['current_session'] not in valid_sessions:
+        if valid_sessions:
+            app.storage.user['current_session'] = valid_sessions[0]
+        else:
+            app.storage.user['current_session'] = create_session(USER_ID, "New Chat")
 
     # Header
     with ui.header().classes('bg-gray-900 border-b border-gray-800 px-4 py-2 items-center justify-between'):
@@ -74,24 +81,23 @@ def main_page():
                             ui.button('×', on_click=lambda s=sid: remove_chat(s)).props('flat dense size=sm color=grey-5')
 
             def new_chat():
-                app.storage.user['current_session'] = create_session(USER_ID, "New Chat")
-                render_sidebar()
-                render_chat()
+                new_id = create_session(USER_ID, "New Chat")
+                ui.navigate.to(f'/?session={new_id}')
 
             def switch_session(sid):
-                if sid == app.storage.user['current_session']:
+                if sid == app.storage.user.get('current_session'):
                     return
-                app.storage.user['current_session'] = sid
-                render_sidebar()
-                render_chat()
+                ui.navigate.to(f'/?session={sid}')
 
             def remove_chat(sid):
                 delete_session(sid, USER_ID)
-                if app.storage.user['current_session'] == sid:
+                if app.storage.user.get('current_session') == sid:
                     sessions = get_sessions(USER_ID)
-                    app.storage.user['current_session'] = sessions[0][0] if sessions else create_session(USER_ID, "New Chat")
-                render_sidebar()
-                render_chat()
+                    if sessions:
+                        ui.navigate.to(f'/?session={sessions[0][0]}')
+                    else:
+                        new_id = create_session(USER_ID, "New Chat")
+                        ui.navigate.to(f'/?session={new_id}')
 
             render_sidebar()
 
@@ -121,7 +127,6 @@ def main_page():
                                 with ui.avatar().classes('bg-blue-500'):
                                     ui.label('✦').classes('text-white')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
-                                    # Clean the text to remove sources
                                     display_text = clean_text(m['content'])
                                     is_err = any(w in display_text.lower() for w in ("failed", "error", "offline", "cannot"))
                                     color = 'text-red-400' if is_err else 'text-gray-200'
@@ -253,7 +258,6 @@ def main_page():
                                     status.visible = False
                                     holder.clear()
                                     
-                                    # Clean the text to remove sources
                                     display_text = clean_text(final)
                                     is_err = any(w in display_text.lower() for w in ("failed", "error", "offline", "cannot"))
                                     color = 'text-red-400' if is_err else 'text-gray-200'
