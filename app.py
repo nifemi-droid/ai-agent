@@ -28,6 +28,12 @@ GLOBAL_CSS = """
 </style>
 """
 
+def clean_text(content):
+    """Removes the [SOURCES] tag and everything after it."""
+    if "[SOURCES]" in content:
+        return content.split("[SOURCES]")[0].strip()
+    return content
+
 @ui.page('/')
 def main_page():
     global current_task
@@ -101,6 +107,7 @@ def main_page():
                         with ui.column().classes('w-full items-center justify-center mt-32 opacity-50'):
                             ui.label('✦').classes('text-6xl text-blue-400 mb-4')
                             ui.label('How can I help you today?').classes('text-2xl text-gray-400')
+                
                 for i, m in enumerate(msgs):
                     if m['role'] == 'user':
                         with chat_box:
@@ -114,20 +121,16 @@ def main_page():
                                 with ui.avatar().classes('bg-blue-500'):
                                     ui.label('✦').classes('text-white')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
-                                    is_err = any(w in m['content'].lower() for w in ("failed", "error", "offline", "cannot"))
+                                    # Clean the text to remove sources
+                                    display_text = clean_text(m['content'])
+                                    is_err = any(w in display_text.lower() for w in ("failed", "error", "offline", "cannot"))
                                     color = 'text-red-400' if is_err else 'text-gray-200'
                                     
-                                    if "[SOURCES]" in m['content']:
-                                        head, tail = m['content'].split("[SOURCES]", 1)
-                                        ui.markdown(head).classes(color)
-                                        ui.label('Sources').classes('text-xs font-bold text-gray-500 mt-2')
-                                        for url in tail.split("|"):
-                                            if url.strip().startswith("http"):
-                                                ui.link(url.strip(), url.strip()).classes('text-xs text-blue-400 block truncate')
-                                    else:
-                                        ui.markdown(m['content']).classes(color)
+                                    ui.markdown(display_text).classes(color)
+                                    
                                     if i == len(msgs) - 1:
                                         ui.button('Regenerate', on_click=lambda: regenerate()).props('flat dense size=sm color=grey-5').classes('mt-2')
+                
                 ui.run_javascript('const e=document.querySelector(".q-page-container"); if(e) e.scrollTop=e.scrollHeight;')
 
             render_chat()
@@ -249,10 +252,14 @@ def main_page():
                                     got_answer = True
                                     status.visible = False
                                     holder.clear()
-                                    is_err = any(w in final.lower() for w in ("failed", "error", "offline", "cannot"))
+                                    
+                                    # Clean the text to remove sources
+                                    display_text = clean_text(final)
+                                    is_err = any(w in display_text.lower() for w in ("failed", "error", "offline", "cannot"))
                                     color = 'text-red-400' if is_err else 'text-gray-200'
+                                    
                                     with holder:
-                                        ui.markdown(final).classes(color)
+                                        ui.markdown(display_text).classes(color)
                                     ui.run_javascript('const e=document.querySelector(".q-page-container"); if(e) e.scrollTop=e.scrollHeight;')
                         except asyncio.CancelledError:
                             status.text = 'Stopped.'
