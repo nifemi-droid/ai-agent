@@ -40,7 +40,6 @@ def main_page(session: str = None):
     ui.add_head_html(GLOBAL_CSS, shared=True)
     ui.dark_mode().enable()
 
-    # Security-checked session loading from URL
     valid_sessions = [s[0] for s in get_sessions(USER_ID)]
     
     if session and session in valid_sessions:
@@ -128,7 +127,9 @@ def main_page(session: str = None):
                                     ui.label('✦').classes('text-white')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
                                     display_text = clean_text(m['content'])
-                                    is_err = any(w in display_text.lower() for w in ("failed", "error", "offline", "cannot"))
+                                    
+                                    # Check if the message *starts* with "Error" or "Web search failed"
+                                    is_err = display_text.startswith("Error:") or display_text.startswith("Web search failed") or display_text.startswith("Document error")
                                     color = 'text-red-400' if is_err else 'text-gray-200'
                                     
                                     ui.markdown(display_text).classes(color)
@@ -219,7 +220,6 @@ def main_page(session: str = None):
                         input_box.value = ''
                         save_message(app.storage.user['current_session'], 'user', prompt, USER_ID)
                         
-                        # Render user bubble immediately
                         with chat_box:
                             with ui.row().classes('w-full justify-end items-start gap-2'):
                                 idx = len(load_messages(app.storage.user['current_session'], USER_ID)) - 1
@@ -247,6 +247,7 @@ def main_page(session: str = None):
                         
                         final = ""
                         got_answer = False
+                        is_error = False
                         try:
                             current_task = asyncio.current_task()
                             async for kind, content in ask_agent_v2_stream(prompt, USER_ID):
@@ -259,8 +260,9 @@ def main_page(session: str = None):
                                     holder.clear()
                                     
                                     display_text = clean_text(final)
-                                    is_err = any(w in display_text.lower() for w in ("failed", "error", "offline", "cannot"))
-                                    color = 'text-red-400' if is_err else 'text-gray-200'
+                                    # Check if the response IS an error, not just contains the word
+                                    is_error = display_text.startswith("Web search failed") or display_text.startswith("Document error") or display_text.startswith("Error:")
+                                    color = 'text-red-400' if is_error else 'text-gray-200'
                                     
                                     with holder:
                                         ui.markdown(display_text).classes(color)
@@ -279,6 +281,7 @@ def main_page(session: str = None):
                                 ui.markdown(err).classes('text-red-400')
                             final = err
                             got_answer = True
+                            is_error = True
                         finally:
                             current_task = None
                             stop_btn.classes(add='hidden')
@@ -290,6 +293,7 @@ def main_page(session: str = None):
                             with holder:
                                 ui.markdown("**No answer was returned.** Check the terminal for errors.").classes('text-red-400')
                             final = "No answer was returned."
+                            is_error = True
                         
                         save_message(app.storage.user['current_session'], 'assistant', final, USER_ID)
                         msgs = load_messages(app.storage.user['current_session'], USER_ID)
