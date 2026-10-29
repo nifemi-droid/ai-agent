@@ -10,7 +10,6 @@ import os
 import asyncio
 
 ensure_dbs_exist()
-
 current_task = None
 
 def is_logged_in():
@@ -21,14 +20,11 @@ def login_page():
     if is_logged_in():
         ui.navigate.to('/')
         return
-
     with ui.column().classes('w-full h-screen items-center justify-center bg-gray-50'):
         with ui.card().classes('w-96 p-8 shadow-xl rounded-xl'):
             ui.label('🌌 Nexus AI').classes('text-h4 text-center mb-6 font-bold text-gray-800')
-            
             email = ui.input('Email').props('outlined rounded').classes('w-full mb-4')
             password = ui.input('Password', password=True, password_toggle_button=True).props('outlined rounded').classes('w-full mb-6')
-            
             async def handle_login():
                 user_id = authenticate_user(email.value, password.value)
                 if user_id:
@@ -36,7 +32,6 @@ def login_page():
                     ui.navigate.to('/')
                 else:
                     ui.notify('Invalid email or password', type='negative')
-
             async def handle_register():
                 user_id = create_user(email.value, password.value)
                 if user_id:
@@ -45,7 +40,6 @@ def login_page():
                     ui.navigate.to('/')
                 else:
                     ui.notify('Email already exists', type='warning')
-
             with ui.row().classes('w-full justify-between gap-2'):
                 ui.button('Login', on_click=handle_login).props('rounded color=primary').classes('w-1/2')
                 ui.button('Register', on_click=handle_register).props('flat color=primary').classes('w-1/2')
@@ -53,13 +47,10 @@ def login_page():
 @ui.page('/')
 def main_page():
     global current_task
-    
     if not is_logged_in():
         ui.navigate.to('/login')
         return
-
     user_id = app.storage.user['user_id']
-
     if 'current_session' not in app.storage.user:
         sessions = get_sessions(user_id)
         app.storage.user['current_session'] = sessions[0][0] if sessions else create_session(user_id, "New Chat")
@@ -67,7 +58,6 @@ def main_page():
     dark = ui.dark_mode()
     dark.enable()
 
-    # --- JS INJECTION FOR COPY CODE BUTTONS ---
     ui.add_head_html('''
         <script>
             document.addEventListener('click', function(e) {
@@ -82,7 +72,6 @@ def main_page():
                     }
                 }
             });
-            
             function addCopyButtons() {
                 document.querySelectorAll('pre').forEach(pre => {
                     if (!pre.querySelector('.copy-code-btn')) {
@@ -94,7 +83,6 @@ def main_page():
                     }
                 });
             }
-            
             setInterval(addCopyButtons, 1000);
         </script>
     ''')
@@ -103,15 +91,11 @@ def main_page():
         with ui.row().classes('items-center gap-2'):
             ui.icon('auto_awesome', size='sm').classes('text-blue-400')
             ui.label('Nexus AI').classes('text-h6 font-semibold')
-            
         with ui.row().classes('items-center gap-4'):
-            # Rate Limit Badge
             remaining = get_rate_limit_status(user_id)
             badge_color = 'text-green-400' if remaining > 5 else 'text-yellow-400' if remaining > 0 else 'text-red-400'
             ui.label(f'⚡ {remaining}/10').classes(f'text-sm font-bold {badge_color}').tooltip('Messages remaining this minute')
-            
             ui.switch('Dark Mode', value=True, on_change=lambda e: dark.enable() if e.value else dark.disable()).props('color=blue-400')
-            
             def logout():
                 del app.storage.user['user_id']
                 del app.storage.user['current_session']
@@ -120,13 +104,10 @@ def main_page():
             ui.button(icon='settings', on_click=lambda: ui.navigate.to('/settings')).props('flat round dense color=white')
 
     with ui.row().classes('w-full no-wrap h-[calc(100vh-60px)] bg-gray-900'):
-        
         # --- SIDEBAR ---
         with ui.column().classes('w-64 bg-gray-950 h-full overflow-y-auto border-r border-gray-800 p-3'):
             ui.button('New Chat', icon='add', on_click=lambda: create_new_chat()).props('rounded flat color=blue-400 align=left').classes('w-full mb-4')
-            
             ui.label('Recent Chats').classes('text-xs font-bold text-gray-500 uppercase tracking-wider mb-2 px-2')
-            
             chat_list_container = ui.column().classes('w-full gap-1')
             
             def refresh_sidebar():
@@ -134,7 +115,6 @@ def main_page():
                 for sid, title in get_sessions(user_id):
                     is_active = (sid == app.storage.user['current_session'])
                     bg_class = 'bg-gray-800 text-white' if is_active else 'text-gray-300 hover:bg-gray-800'
-                    
                     with ui.row().classes(f'w-full items-center justify-between rounded p-2 cursor-pointer transition-colors {bg_class}'):
                         ui.label(title).classes('truncate text-sm flex-grow').on('click', lambda s=sid: load_chat(s))
                         ui.button(icon='delete', on_click=lambda s=sid: remove_chat(s)).props('flat dense round size=sm color=grey-5').classes('opacity-0 hover:opacity-100 transition-opacity')
@@ -151,7 +131,8 @@ def main_page():
                 refresh_chat()
                 
             def remove_chat(sid):
-                delete_session(sid)
+                # IDOR FIX: Pass user_id to delete_session
+                delete_session(sid, user_id)
                 if app.storage.user['current_session'] == sid:
                     sessions = get_sessions(user_id)
                     app.storage.user['current_session'] = sessions[0][0] if sessions else create_session(user_id, "New Chat")
@@ -162,7 +143,6 @@ def main_page():
 
         # --- MAIN CHAT AREA ---
         with ui.column().classes('flex-grow h-full flex flex-col relative'):
-            
             ui.add_head_html('''
                 <script>
                     function scrollToBottom() {
@@ -171,7 +151,6 @@ def main_page():
                     }
                 </script>
             ''')
-            
             chat_container = ui.column().classes('w-full max-w-3xl mx-auto gap-6 overflow-y-auto flex-grow p-4 pb-24')
             
             def render_message_content(container, content, message_index, total_messages):
@@ -204,10 +183,10 @@ def main_page():
 
             def refresh_chat():
                 chat_container.clear()
-                messages = load_messages(app.storage.user['current_session'])
+                # IDOR FIX: Pass user_id to load_messages
+                messages = load_messages(app.storage.user['current_session'], user_id)
                 for i, msg in enumerate(messages):
                     sent = msg['role'] == 'user'
-                    
                     if sent:
                         with chat_container:
                             with ui.row().classes('w-full justify-end'):
@@ -224,21 +203,19 @@ def main_page():
             refresh_chat()
 
             async def regenerate_response():
-                messages = load_messages(app.storage.user['current_session'])
+                # IDOR FIX: Pass user_id
+                messages = load_messages(app.storage.user['current_session'], user_id)
                 if not messages or messages[-1]['role'] != 'assistant':
                     return
-                
-                delete_last_message(app.storage.user['current_session'])
+                delete_last_message(app.storage.user['current_session'], user_id)
                 user_prompt = messages[-2]['content'] if len(messages) >= 2 else ""
                 refresh_chat()
-                
                 if user_prompt:
                     await run_agent(user_prompt)
 
             # --- FLOATING INPUT BAR ---
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 shadow-xl rounded-2xl flex-row items-center px-2 py-1 border border-gray-700'):
-                    
                     file_input = ui.element('input').props('type=file accept=".pdf,.csv,.xlsx,.xls" style="display: none;"')
                     file_input.on('change', lambda e: ui.run_javascript('''
                         const file = document.querySelector('input[type=file]').files[0];
@@ -258,32 +235,24 @@ def main_page():
                         await handle_upload_logic(file_name, file_bytes)
 
                     ui.on('file_uploaded', process_file_event)
-
                     ui.button(icon='attach_file', on_click=lambda: ui.run_javascript('document.querySelector("input[type=file]").click()')).props('flat round dense color=grey-5').classes('ml-2')
-                    
                     user_input = ui.input(placeholder='Ask anything...').props('borderless dense').classes('flex-grow text-white bg-transparent')
-                    
                     stop_btn = ui.button('Stop', icon='stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('mr-2 hidden')
                     
                     async def run_agent(prompt):
                         global current_task
-                        
                         stop_btn.classes(remove='hidden')
                         send_btn.classes(add='hidden')
-                        
                         with chat_container:
                             with ui.row().classes('w-full justify-start items-start gap-4') as ai_row:
                                 ui.icon('auto_awesome', size='md').classes('text-blue-400 mt-1 animate-pulse')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
                                     status_label = ui.label('Thinking...').classes('text-gray-400 italic text-sm not-prose')
                                     answer_container = ui.column().classes('w-full')
-                        
                         ui.run_javascript('scrollToBottom()')
-                        
                         final_answer = ""
                         try:
                             current_task = asyncio.current_task()
-                            
                             async for msg_type, content in ask_agent_v2_stream(prompt):
                                 if msg_type == "step":
                                     status_label.text = content
@@ -303,10 +272,8 @@ def main_page():
                             current_task = None
                             stop_btn.classes(add='hidden')
                             send_btn.classes(remove='hidden')
-                        
                         save_message(app.storage.user['current_session'], 'assistant', final_answer)
-                        
-                        messages = load_messages(app.storage.user['current_session'])
+                        messages = load_messages(app.storage.user['current_session'], user_id)
                         if len(messages) == 2:
                             new_title = generate_chat_title(prompt)
                             import sqlite3
@@ -316,37 +283,26 @@ def main_page():
                             cursor.execute("UPDATE sessions SET title = ? WHERE id = ?", (new_title, app.storage.user['current_session']))
                             conn.commit()
                             conn.close()
-                            
                         refresh_sidebar()
                         refresh_chat() 
 
                     async def send_message():
                         global user_id
                         if not user_input.value: return
-                        
-                        # RATE LIMIT CHECK
                         allowed, remaining = check_rate_limit(user_id)
-                        
                         if not allowed:
                             ui.notify('Rate limit exceeded. Please wait 60 seconds.', type='negative', position='top')
                             return
-                        
                         if remaining <= 3:
                             ui.notify(f'Warning: You only have {remaining} messages left this minute.', type='warning', position='top')
-                        
                         prompt = user_input.value
                         user_input.value = ''
-                        
                         save_message(app.storage.user['current_session'], 'user', prompt)
-                        
                         with chat_container:
                             with ui.row().classes('w-full justify-end'):
                                 with ui.card().classes('bg-gray-800 text-white rounded-2xl max-w-[80%] px-4 py-2 shadow-none'):
                                     ui.markdown(prompt)
-                        
                         await run_agent(prompt)
-                        
-                        # Refresh the header badge
                         ui.navigate.to('/')
 
                     def stop_generation():
@@ -360,7 +316,6 @@ def main_page():
             async def handle_upload_logic(file_name, file_bytes):
                 ui.notify(f"Processing {file_name}...", type='info', position='top')
                 res = await ui.run.io_bound(ingest_file, file_bytes, file_name)
-                
                 with chat_container:
                     with ui.row().classes('w-full justify-center'):
                         ui.badge(f"📁 System: {res}", color='gray-700').classes('text-gray-300 text-xs')
@@ -370,24 +325,19 @@ def settings_page():
     if not is_logged_in():
         ui.navigate.to('/login')
         return
-
     user_id = app.storage.user['user_id']
     user_email = get_user_email(user_id)
     user_role = get_user_role(user_id)
-
     with ui.header().classes('items-center justify-between bg-gray-900 text-white p-4 border-b border-gray-800'):
         ui.label('⚙️ Settings & Profile').classes('text-h5 font-bold')
         ui.button('Back to Chat', on_click=lambda: ui.navigate.to('/')).props('flat color=white')
-        
     with ui.column().classes('w-full max-w-5xl mx-auto p-8 bg-gray-900 min-h-screen'):
-        
         ui.label('Profile').classes('text-h5 text-white mb-4')
         with ui.card().classes('w-full bg-gray-800 border border-gray-700 p-6 mb-8 flex-row items-center justify-between'):
             with ui.column():
                 ui.label(f"Email: {user_email}").classes('text-white text-lg')
                 badge_color = 'bg-blue-600' if user_role == 'admin' else 'bg-gray-600'
                 ui.badge(f"Role: {user_role.upper()}", color=badge_color).classes('mt-2')
-            
             with ui.column().classes('gap-2'):
                 new_password = ui.input('New Password', password=True, password_toggle_button=True).props('outlined rounded dense').classes('w-64')
                 async def update_password():
@@ -398,7 +348,6 @@ def settings_page():
                     ui.notify('Password updated successfully!', type='positive')
                     new_password.value = ''
                 ui.button('Update Password', on_click=update_password).props('rounded color=primary')
-
         ui.label('My Chat History').classes('text-h5 text-white mb-4')
         sessions = get_all_sessions_for_user(user_id)
         if not sessions:
@@ -410,27 +359,21 @@ def settings_page():
                 {'name': 'actions', 'label': 'Actions', 'field': 'id'},
             ]
             rows = [{'id': s[0], 'title': s[1], 'date': s[2]} for s in sessions]
-            
             table = ui.table(columns=columns, rows=rows, row_key='id').classes('w-full bg-gray-800 text-white mb-8')
-            
             table.add_slot('body-cell-actions', '''
                 <q-td :props="props">
                     <q-btn icon="delete" flat dense round color="red" @click="() => $parent.$emit('delete', props.row.id)" />
                 </q-td>
             ''')
-            
             def handle_delete(e):
-                delete_session(e.args)
+                # IDOR FIX: Pass user_id
+                delete_session(e.args, user_id)
                 ui.notify('Chat deleted. Refreshing...', type='info')
                 ui.navigate.to('/settings')
-            
             table.on('delete', handle_delete)
-
         ui.separator().classes('bg-gray-700 my-8')
-
         if is_admin(user_id):
             ui.label('Admin Analytics').classes('text-h5 text-white mb-4')
-            
             route_data = get_analytics_by_route()
             if not route_data:
                 ui.label('No analytics data yet.').classes('text-gray-500')
@@ -441,20 +384,13 @@ def settings_page():
                         chart_data = [{'value': v, 'name': k} for k, v in route_data.items()]
                         ui.echart({
                             'tooltip': {'trigger': 'item'},
-                            'series': [{
-                                'type': 'pie',
-                                'radius': ['40%', '70%'],
-                                'data': chart_data,
-                                'label': {'color': '#fff'}
-                            }]
+                            'series': [{'type': 'pie', 'radius': ['40%', '70%'], 'data': chart_data, 'label': {'color': '#fff'}}]
                         }).classes('w-full h-64')
-                        
                     with ui.card().classes('w-1/2 bg-gray-800 border border-gray-700 p-4'):
                         ui.label('Recent Latency (seconds)').classes('text-white font-bold mb-2')
                         recent = get_analytics()[:10]
                         latencies = [round(r[2], 2) for r in reversed(recent)]
                         labels = [f"Query {i+1}" for i in range(len(latencies))]
-                        
                         ui.echart({
                             'xAxis': {'type': 'category', 'data': labels, 'axisLabel': {'color': '#aaa'}},
                             'yAxis': {'type': 'value', 'axisLabel': {'color': '#aaa'}},
