@@ -27,27 +27,25 @@ def verify_password(password, stored_hash):
         actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
         return secrets.compare_digest(actual, expected)
     except (ValueError, TypeError):
+        # Fallback for legacy SHA256 hashes
         return secrets.compare_digest(hashlib.sha256(password.encode("utf-8")).hexdigest(), stored_hash)
 
 def ensure_dbs_exist():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
+    # 1. Users Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
             email TEXT UNIQUE,
             password TEXT,
-            role TEXT DEFAULT 'user'
+            role TEXT DEFAULT 'user',
+            timestamp DATETIME
         )
     """)
     
-    # Idempotent migration: add timestamp column if it doesn't exist
-    cursor.execute("PRAGMA table_info(users)")
-    existing_cols = [c[1] for c in cursor.fetchall()]
-    if "timestamp" not in existing_cols:
-        cursor.execute("ALTER TABLE users ADD COLUMN timestamp DATETIME DEFAULT CURRENT_TIMESTAMP")
-    
+    # 2. Sessions Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
@@ -58,6 +56,7 @@ def ensure_dbs_exist():
         )
     """)
     
+    # 3. Messages Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,6 +68,7 @@ def ensure_dbs_exist():
         )
     """)
     
+    # 4. Analytics Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS analytics (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,6 +79,7 @@ def ensure_dbs_exist():
         )
     """)
     
+    # 5. Rate Limiting Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS rate_limits (
             user_id TEXT PRIMARY KEY,
@@ -89,6 +90,7 @@ def ensure_dbs_exist():
     conn.commit()
     conn.close()
 
+    # 6. Ensure sales DB exists (legacy fallback, not used in the focused app)
     if not os.path.exists(SALES_DB):
         conn = sqlite3.connect(SALES_DB)
         cursor = conn.cursor()
@@ -121,8 +123,12 @@ def create_user(email, password):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     user_id = str(uuid.uuid4())
+    now = datetime.datetime.now()
     try:
-        cursor.execute("INSERT INTO users (id, email, password) VALUES (?, ?, ?)", (user_id, email, hash_password(password)))
+        cursor.execute(
+            "INSERT INTO users (id, email, password, timestamp) VALUES (?, ?, ?, ?)", 
+            (user_id, email, hash_password(password), now)
+        )
         conn.commit()
         return user_id
     except sqlite3.IntegrityError:
