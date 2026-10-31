@@ -116,11 +116,15 @@ def ingest_files(files, user_id):
         if not safe_name.endswith(ALLOWED_EXTENSIONS):
             return f"Upload rejected: unsupported file type '{safe_name}'."
 
-        import base64
-        try:
-            data = base64.b64decode(f.get("data", ""))
-        except Exception:
-            return "Upload rejected: malformed file data."
+        payload = f.get("data", b"")
+        if isinstance(payload, bytes):
+            data = payload
+        else:
+            import base64
+            try:
+                data = base64.b64decode(payload.encode() if isinstance(payload, str) else payload)
+            except Exception:
+                return "Upload rejected: malformed file data."
 
         if len(data) > MAX_FILE_BYTES:
             return f"Upload rejected: '{safe_name}' exceeds 10 MB."

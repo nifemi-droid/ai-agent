@@ -4,7 +4,6 @@ from database import (ensure_dbs_exist, create_session, get_sessions, load_messa
                       save_message, delete_session, update_user_password,
                       get_user_email, get_all_sessions_for_user,
                       delete_last_message, check_rate_limit, get_rate_limit_status)
-import base64
 import os
 import asyncio
 from dotenv import load_dotenv
@@ -165,22 +164,35 @@ def main_page(session: str = None):
                     
                     # --- NATIVE NICE GUI UPLOADER (Hidden but functional) ---
                     async def handle_native_upload(e):
-                        # Correctly read the file without await
-                        file_bytes = e.content.read()
-                        
+                        file_bytes = await e.file.read()
+                        file_name = e.file.name
+
                         if len(file_bytes) > 10 * 1024 * 1024:
                             ui.notify('File exceeds 10 MB limit.', type='negative')
                             return
-                        
-                        res = await ui.run.io_bound(ingest_files, [{"name": e.name, "data": base64.b64encode(file_bytes).decode()}], USER_ID)
+
+                        res = await ui.run.io_bound(
+                            ingest_files,
+                            [{"name": file_name, "data": file_bytes}],
+                            USER_ID,
+                        )
                         ui.notify(res, type='info')
                         with chat_box:
                             with ui.row().classes('w-full justify-center'):
                                 ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
 
                     # Hide the uploader using a custom class
-                    uploader = ui.upload(on_upload=handle_native_upload, auto_upload=True)\
-                        .props('accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx"')\
+                    def handle_upload_rejected(e):
+                        ui.notify('Upload rejected: choose one supported file smaller than 10 MB.', type='negative')
+
+                    uploader = ui.upload(
+                        on_upload=handle_native_upload,
+                        on_rejected=handle_upload_rejected,
+                        auto_upload=True,
+                        max_file_size=10 * 1024 * 1024,
+                        max_total_size=10 * 1024 * 1024,
+                        max_files=1,
+                    ).props('accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx"')\
                         .classes('hidden-uploader')
 
                     # This CSS hides the uploader entirely
