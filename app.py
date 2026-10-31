@@ -128,7 +128,7 @@ def main_page(session: str = None):
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
                                     display_text = clean_text(m['content'])
                                     
-                                    # Check ONLY the exact first 20 characters for hard errors
+                                    # Check only the first 20 characters for hard errors
                                     prefix = display_text[:20]
                                     is_err = prefix.startswith("Web search failed") or prefix.startswith("Document error") or prefix.startswith("**Error:**")
                                     color = 'text-red-400' if is_err else 'text-gray-200'
@@ -162,36 +162,33 @@ def main_page(session: str = None):
             # Input
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 rounded-2xl flex-col p-2 border border-gray-700'):
-                    file_input = ui.element('input')\
-                        .props('type=file multiple accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" style="display:none"')\
-                        .on('change', lambda e: ui.run_javascript('''
-                            const f=document.querySelector("input[type=file]").files;
-                            const files=Array.from(f).slice(0,3);
-                            let total=0,out=[],pending=files.length;
-                            if(!pending) return;
-                            files.forEach(file=>{
-                                if(file.size>10*1024*1024){emitEvent("upload_error",{msg:"File exceeds 10 MB"});pending--;return;}
-                                total+=file.size;
-                                if(total>25*1024*1024){emitEvent("upload_error",{msg:"Total exceeds 25 MB"});pending--;return;}
-                                const r=new FileReader();
-                                r.onload=e=>{
-                                    out.push({name:file.name,data:e.target.result.split(",")[1]});
-                                    pending--;
-                                    if(pending===0&&out.length) emitEvent("files_ready",{files:out});
-                                };
-                                r.readAsDataURL(file);
-                            });
-                        '''))
-
-                    async def on_files(e):
-                        res = await ui.run.io_bound(ingest_files, e.args.get('files', []), USER_ID)
+                    
+                    # --- NATIVE NICE GUI UPLOADER (Hidden but functional) ---
+                    async def handle_native_upload(e):
+                        # Correctly read the file without await
+                        file_bytes = e.content.read()
+                        
+                        if len(file_bytes) > 10 * 1024 * 1024:
+                            ui.notify('File exceeds 10 MB limit.', type='negative')
+                            return
+                        
+                        res = await ui.run.io_bound(ingest_files, [{"name": e.name, "data": base64.b64encode(file_bytes).decode()}], USER_ID)
                         ui.notify(res, type='info')
+                        with chat_box:
+                            with ui.row().classes('w-full justify-center'):
+                                ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
 
-                    def on_err(e):
-                        ui.notify(e.args.get('msg', 'Upload failed'), type='negative')
+                    # Hide the uploader using a custom class
+                    uploader = ui.upload(on_upload=handle_native_upload, auto_upload=True)\
+                        .props('accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx"')\
+                        .classes('hidden-uploader')
 
-                    ui.on('files_ready', on_files)
-                    ui.on('upload_error', on_err)
+                    # This CSS hides the uploader entirely
+                    ui.add_head_html("""
+                        <style>
+                            .hidden-uploader { display: none !important; }
+                        </style>
+                    """)
 
                     input_box = ui.textarea(placeholder='Ask anything — Enter to send, Shift+Enter for new line')\
                         .props('outlined dense autogrow')\
@@ -199,7 +196,8 @@ def main_page(session: str = None):
 
                     with ui.row().classes('w-full justify-between items-center'):
                         with ui.row().classes('gap-2'):
-                            ui.button('📎 Attach', on_click=lambda: ui.run_javascript('document.querySelector("input[type=file]").click()')).props('flat dense color=grey-5')
+                            # Trigger the hidden uploader via JS
+                            ui.button('📎 Attach', on_click=lambda: ui.run_javascript('document.querySelector(".hidden-uploader input").click()')).props('flat dense color=grey-5')
                         with ui.row().classes('gap-2'):
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
                             send_btn = ui.button('Send', on_click=lambda: send()).props('flat dense color=blue-400')
@@ -248,7 +246,6 @@ def main_page(session: str = None):
                         
                         final = ""
                         got_answer = False
-                        is_error = False
                         try:
                             current_task = asyncio.current_task()
                             async for kind, content in ask_agent_v2_stream(prompt, USER_ID):
@@ -261,7 +258,6 @@ def main_page(session: str = None):
                                     holder.clear()
                                     
                                     display_text = clean_text(final)
-                                    # Only red if it's the exact error string
                                     prefix = display_text[:20]
                                     is_err = prefix.startswith("Web search failed") or prefix.startswith("Document error")
                                     color = 'text-red-400' if is_err else 'text-gray-200'
@@ -283,7 +279,6 @@ def main_page(session: str = None):
                                 ui.markdown(err).classes('text-red-400')
                             final = err
                             got_answer = True
-                            is_error = True
                         finally:
                             current_task = None
                             stop_btn.classes(add='hidden')
@@ -295,7 +290,6 @@ def main_page(session: str = None):
                             with holder:
                                 ui.markdown("**No answer was returned.** Check the terminal for errors.").classes('text-red-400')
                             final = "No answer was returned."
-                            is_error = True
                         
                         save_message(app.storage.user['current_session'], 'assistant', final, USER_ID)
                         msgs = load_messages(app.storage.user['current_session'], USER_ID)
