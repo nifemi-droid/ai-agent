@@ -305,10 +305,11 @@ def main_page(session: str = None):
                                 ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
                         ui.run_javascript('setTimeout(scrollToBottom, 100);')
 
-                    # Create hidden uploader but allow it to be clicked
+                    # Create uploader, then hide it separately
                     uploader = ui.upload(on_upload=handle_native_upload, auto_upload=True)\
-                        .props('accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx"')\
-                        .set_visibility(False)
+                        .props('accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx"')
+
+                    uploader.set_visibility(False)
                     uploader.ignores_events_when_hidden = False
 
                     input_box = ui.textarea(placeholder='Ask anything — Enter to send, Shift+Enter for new line')\
