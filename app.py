@@ -25,7 +25,30 @@ GLOBAL_CSS = """
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
 
-    /* --- TABLE STYLING (PM Specs) --- */
+    /* --- FLOATING SCROLL BUTTON --- */
+    #float-scroll-btn {
+        display: none;
+        position: fixed;
+        bottom: 120px;
+        right: calc(50% - 380px);
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        background-color: #1f2937;
+        border: 1px solid #374151;
+        color: #9ca3af;
+        cursor: pointer;
+        align-items: center;
+        justify-content: center;
+        z-index: 999;
+        transition: all 0.2s;
+    }
+    #float-scroll-btn:hover {
+        background-color: #374151;
+        color: #ffffff;
+    }
+
+    /* --- TABLE STYLING --- */
     .prose table {
         width: 100%;
         border-collapse: collapse;
@@ -143,19 +166,21 @@ def main_page(session: str = None):
         # Main Chat Area
         with ui.column().classes('flex-grow h-full flex flex-col relative'):
             
-            # JS for tracking scroll AND adding copy buttons
-            ui.add_head_html('''
+            # Native HTML Scroll Button and JS
+            ui.add_body_html('''
+                <button id="float-scroll-btn" onclick="window.scrollToBottom()">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
+                </button>
                 <script>
                     window.scrollToBottom = function() {
                         const el = document.querySelector('.q-page-container');
                         if (el) el.scrollTop = el.scrollHeight;
-                        const btn = document.getElementById('scroll-btn');
-                        if (btn) btn.style.display = 'none';
+                        document.getElementById('float-scroll-btn').style.display = 'none';
                     };
                     
                     window.checkScroll = function() {
                         const el = document.querySelector('.q-page-container');
-                        const btn = document.getElementById('scroll-btn');
+                        const btn = document.getElementById('float-scroll-btn');
                         if (el && btn) {
                             if (el.scrollHeight - el.scrollTop - el.clientHeight > 200) {
                                 btn.style.display = 'flex';
@@ -239,28 +264,16 @@ def main_page(session: str = None):
                                                 if u.startswith("http"):
                                                     ui.link(u, u).classes('text-blue-400 block truncate mb-1 hover:underline')
                                     
-                                    # --- EXPORT & REGENERATE BUTTONS ---
                                     with ui.row().classes('mt-2 gap-2 items-center'):
                                         def download_export(text_content=display_text, idx=i):
                                             ui.download(text_content.encode('utf-8'), f"nexus_export_{idx}.md")
-                                            
-                                        ui.button('⬇️ Export to Markdown', on_click=download_export)\
-                                            .props('flat dense size=sm color=grey-5')\
-                                            .tooltip('Download this document as a Markdown file')
-                                            
+                                        ui.button('⬇️ Export to Markdown', on_click=download_export).props('flat dense size=sm color=grey-5')
                                         if i == len(msgs) - 1:
-                                            ui.button('🔄 Regenerate', on_click=lambda: regenerate())\
-                                                .props('flat dense size=sm color=grey-5')
+                                            ui.button('🔄 Regenerate', on_click=lambda: regenerate()).props('flat dense size=sm color=grey-5')
                 
                 ui.run_javascript('setTimeout(scrollToBottom, 200);')
 
             render_chat()
-
-            # Scroll Down Button
-            scroll_btn = ui.button('↓', on_click=lambda: ui.run_javascript('scrollToBottom()'))\
-                .props('round dense')\
-                .classes('fixed bottom-28 right-[calc(50%-400px)] bg-gray-800 text-gray-400 border border-gray-700 shadow-lg z-50')\
-                .style('display: none;')
                 
             chat_box.on('scroll', lambda: ui.run_javascript('checkScroll()'))
 
@@ -318,9 +331,7 @@ def main_page(session: str = None):
 
                     with ui.row().classes('w-full justify-between items-center'):
                         with ui.row().classes('gap-2 items-center'):
-                            # The custom button triggers the hidden uploader
-                            ui.button('📎 Attach', on_click=lambda: uploader.run_method('pickFiles'))\
-                                .props('flat dense color=grey-5')
+                            ui.button('📎 Attach', on_click=lambda: uploader.run_method('pickFiles')).props('flat dense color=grey-5')
                             
                         with ui.row().classes('gap-2'):
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
@@ -433,7 +444,6 @@ def main_page(session: str = None):
                                 ui.markdown("**No answer was returned.** Check the terminal for errors.").classes('text-red-400')
                             final = "No answer was returned."
                         
-                        # Add Export button to live stream
                         if got_answer and not final.startswith("**Error"):
                             clean_export_text = final.split("[SOURCES]")[0].strip() if "[SOURCES]" in final else final
                             def download_live_export(text_content=clean_export_text):
