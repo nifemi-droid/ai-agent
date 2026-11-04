@@ -16,8 +16,6 @@ if not storage_secret or len(storage_secret) < 32:
 
 ensure_dbs_exist()
 current_task = None
-
-# Single-user identity
 USER_ID = "local"
 
 GLOBAL_CSS = """
@@ -25,11 +23,8 @@ GLOBAL_CSS = """
     body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
-    
-    /* Hide the uploader's default UI but keep the input */
-    .hidden-uploader .q-uploader__header { display: none !important; }
-    .hidden-uploader .q-uploader__list { display: none !important; }
-    .hidden-uploader .q-uploader__input { display: none !important; }
+    /* Hide the default uploader box completely */
+    .q-uploader { display: none !important; }
 </style>
 """
 
