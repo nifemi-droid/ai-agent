@@ -29,7 +29,7 @@ GLOBAL_CSS = """
     #float-scroll-btn {
         display: none;
         position: fixed;
-        bottom: 110px;
+        bottom: 120px;
         right: calc(50% - 380px);
         width: 36px;
         height: 36px;
@@ -46,25 +46,6 @@ GLOBAL_CSS = """
     #float-scroll-btn:hover {
         background-color: #374151;
         color: #ffffff;
-    }
-
-    /* --- CUSTOM ATTACH BUTTON --- */
-    .custom-attach-btn {
-        display: inline-flex;
-        align-items: center;
-        cursor: pointer;
-        color: #9ca3af;
-        padding: 8px;
-        border-radius: 4px;
-        transition: background-color 0.2s, color 0.2s;
-        font-size: 0.875rem;
-    }
-    .custom-attach-btn:hover {
-        background-color: rgba(255,255,255,0.1);
-        color: #ffffff;
-    }
-    .custom-attach-btn input[type="file"] {
-        display: none;
     }
 
     /* --- TABLE STYLING --- */
@@ -91,8 +72,12 @@ GLOBAL_CSS = """
         letter-spacing: 0.05em;
         color: #9ca3af;
     }
-    .prose tr:hover { background-color: #1f2937; }
-    .prose tr:last-child td { border-bottom: none; }
+    .prose tr:hover {
+        background-color: #1f2937;
+    }
+    .prose tr:last-child td {
+        border-bottom: none;
+    }
 
     /* --- CODE BLOCK STYLING --- */
     .prose pre {
@@ -181,17 +166,11 @@ def main_page(session: str = None):
         # Main Chat Area
         with ui.column().classes('flex-grow h-full flex flex-col relative'):
             
-            # Inject HTML Buttons directly
+            # Native HTML Scroll Button and JS
             ui.add_body_html('''
                 <button id="float-scroll-btn" onclick="window.scrollToBottom()">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
                 </button>
-                
-                <label class="custom-attach-btn" id="html-attach-label" style="position: absolute; bottom: 88px; left: 22px; z-index: 1000;">
-                    📎 Attach
-                    <input type="file" id="html-file-input" accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" />
-                </label>
-                
                 <script>
                     window.scrollToBottom = function() {
                         const el = document.querySelector('.q-page-container');
@@ -236,20 +215,6 @@ def main_page(session: str = None):
                     }
 
                     setInterval(addCopyButtons, 1000);
-                    
-                    // Wire up the HTML file input
-                    document.getElementById('html-file-input').addEventListener('change', function(e) {
-                        const file = e.target.files[0];
-                        if (file) {
-                            const reader = new FileReader();
-                            reader.onload = function(event) {
-                                const base64Data = event.target.result.split(',')[1];
-                                emitEvent('file_uploaded', {name: file.name, data: base64Data});
-                            };
-                            reader.readAsDataURL(file);
-                        }
-                        e.target.value = ''; // Clear for next upload
-                    });
                 </script>
             ''')
 
@@ -340,23 +305,34 @@ def main_page(session: str = None):
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 rounded-2xl flex-col p-2 border border-gray-700'):
                     
-                    async def handle_file_event(e):
-                        file_name = e.args['name']
-                        file_data = e.args['data']
-                        res = await ui.run.io_bound(ingest_files, [{"name": file_name, "data": file_data}], USER_ID)
+                    async def handle_native_upload(e):
+                        file_bytes = e.content.read()
+                        if len(file_bytes) > 10 * 1024 * 1024:
+                            ui.notify('File exceeds 10 MB limit.', type='negative')
+                            return
+                        
+                        res = await ui.run.io_bound(ingest_files, [{"name": e.name, "data": base64.b64encode(file_bytes).decode()}], USER_ID)
                         ui.notify(res, type='info')
                         with chat_box:
                             with ui.row().classes('w-full justify-center'):
                                 ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
                         ui.run_javascript('setTimeout(scrollToBottom, 100);')
 
-                    ui.on('file_uploaded', handle_file_event)
+                    # Create uploader, then hide it separately
+                    uploader = ui.upload(on_upload=handle_native_upload, auto_upload=True)\
+                        .props('accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx"')
+
+                    uploader.set_visibility(False)
+                    uploader.ignores_events_when_hidden = False
 
                     input_box = ui.textarea(placeholder='Ask anything — Enter to send, Shift+Enter for new line')\
                         .props('outlined dense autogrow')\
-                        .classes('w-full bg-transparent text-white pl-10')
+                        .classes('w-full bg-transparent text-white')
 
-                    with ui.row().classes('w-full justify-end items-center'):
+                    with ui.row().classes('w-full justify-between items-center'):
+                        with ui.row().classes('gap-2 items-center'):
+                            ui.button('📎 Attach', on_click=lambda: uploader.run_method('pickFiles')).props('flat dense color=grey-5')
+                            
                         with ui.row().classes('gap-2'):
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
                             send_btn = ui.button('Send', on_click=lambda: send()).props('flat dense color=blue-400')
