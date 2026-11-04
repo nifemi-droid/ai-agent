@@ -1,9 +1,10 @@
-from nicegui import ui, app, run
+from nicegui import ui, app
 from multi_agent import ask_agent_v2_stream, generate_chat_title, ingest_files
 from database import (ensure_dbs_exist, create_session, get_sessions, load_messages,
                       save_message, delete_session, update_user_password,
                       get_user_email, get_all_sessions_for_user,
                       delete_last_message, check_rate_limit, get_rate_limit_status)
+import base64
 import os
 import asyncio
 from dotenv import load_dotenv
@@ -153,9 +154,23 @@ def main_page(session: str = None):
                                     if i == len(msgs) - 1:
                                         ui.button('Regenerate', on_click=lambda: regenerate()).props('flat dense size=sm color=grey-5').classes('mt-2')
                 
-                ui.run_javascript('const e=document.querySelector(".q-page-container"); if(e) e.scrollTop=e.scrollHeight;')
+                # Delayed scroll to bottom after DOM renders
+                ui.run_javascript('''
+                    setTimeout(function() {
+                        const el = document.querySelector('.q-page-container');
+                        if (el) el.scrollTop = el.scrollHeight;
+                    }, 300); 
+                ''')
 
             render_chat()
+
+            # Delayed auto-focus on the input box
+            ui.run_javascript('''
+                setTimeout(function() {
+                    const input = document.querySelector('textarea');
+                    if (input) input.focus();
+                }, 500);
+            ''')
 
             async def edit_prompt(idx, content):
                 while len(load_messages(app.storage.user['current_session'], USER_ID)) > idx:
@@ -178,51 +193,45 @@ def main_page(session: str = None):
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 rounded-2xl flex-col p-2 border border-gray-700'):
                     
-                    # Native HTTP multipart uploader; file bytes never pass through WebSocket events.
-                    async def handle_upload(e):
-                        file_bytes = await e.file.read()
-                        if len(file_bytes) > 10 * 1024 * 1024:
-                            ui.notify('File exceeds 10 MB limit.', type='negative')
-                            return
-                        res = await run.io_bound(
-                            ingest_files,
-                            [{"name": e.file.name, "data": file_bytes}],
-                            USER_ID,
-                        )
+                    async def handle_file_event(e):
+                        file_name = e.args['name']
+                        file_data = e.args['data']
+                        res = await ui.run.io_bound(ingest_files, [{"name": file_name, "data": file_data}], USER_ID)
                         ui.notify(res, type='info')
                         with chat_box:
                             with ui.row().classes('w-full justify-center'):
                                 ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
 
-                    def handle_upload_rejected(e):
-                        ui.notify('Upload rejected: choose one supported file smaller than 10 MB.', type='negative')
+                    ui.on('file_uploaded', handle_file_event)
 
-                    uploader = ui.upload(
-                        on_upload=handle_upload,
-                        on_rejected=handle_upload_rejected,
-                        auto_upload=True,
-                        max_file_size=10 * 1024 * 1024,
-                        max_total_size=10 * 1024 * 1024,
-                        max_files=1,
-                    ).props('accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx"')\
-                        .classes('hidden-uploader')
+                    # Hidden native HTML input with a custom label
+                    ui.add_body_html('''
+                        <label class="custom-file-upload" style="position: absolute; bottom: 15px; left: 15px; z-index: 100;">
+                            📎 Attach
+                            <input type="file" id="native-upload" accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" />
+                        </label>
+                        <script>
+                            document.getElementById('native-upload').addEventListener('change', function(e) {
+                                const file = e.target.files[0];
+                                if (file) {
+                                    const reader = new FileReader();
+                                    reader.onload = function(event) {
+                                        const base64Data = event.target.result.split(',')[1];
+                                        emitEvent('file_uploaded', {name: file.name, data: base64Data});
+                                    };
+                                    reader.readAsDataURL(file);
+                                }
+                                e.target.value = '';
+                            });
+                        </script>
+                    ''')
 
-                    ui.add_head_html("""
-                    <style>.hidden-uploader { display: none !important; }</style>
-                    """)
+                    # The textarea (with padding to make room for the absolute Attach button)
                     input_box = ui.textarea(placeholder='Ask anything — Enter to send, Shift+Enter for new line')\
                         .props('outlined dense autogrow')\
-                        .classes('w-full bg-transparent text-white')
+                        .classes('w-full bg-transparent text-white pl-24')
 
-                    with ui.row().classes('w-full justify-between items-center'):
-                        with ui.row().classes('gap-2'):
-                            ui.button(
-                                '📎 Attach',
-                                on_click=lambda: ui.run_javascript(
-                                    'const input=document.querySelector(".hidden-uploader input[type=file]"); if(input) input.click();'
-                                ),
-                            ).props('flat dense color=grey-5')
-
+                    with ui.row().classes('w-full justify-end items-center'):
                         with ui.row().classes('gap-2'):
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
                             send_btn = ui.button('Send', on_click=lambda: send()).props('flat dense color=blue-400')
