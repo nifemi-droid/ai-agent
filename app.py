@@ -19,19 +19,84 @@ current_task = None
 USER_ID = "local"
 
 GLOBAL_CSS = """
+<link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
 <style>
     body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
-    /* Hide the default uploader box completely */
-    .q-uploader { display: none !important; }
+    
+    /* Hide the default uploader UI but keep the input functional */
+    .hidden-uploader .q-uploader__header { display: none !important; }
+    .hidden-uploader .q-uploader__list { display: none !important; }
+    .hidden-uploader .q-uploader__input { display: none !important; }
+    
+    /* Style the native file input to look like a clean button */
+    .custom-file-upload {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        color: #9ca3af;
+        padding: 8px;
+        border-radius: 50%;
+        transition: background-color 0.2s;
+    }
+    .custom-file-upload:hover {
+        background-color: rgba(255,255,255,0.1);
+        color: #fff;
+    }
+    .custom-file-upload input[type="file"] {
+        display: none;
+    }
+
+    /* --- TABLE STYLING (PM Specs) --- */
+    .prose table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 1.5rem 0;
+        font-size: 0.9rem;
+        background-color: #1f2937;
+        border-radius: 8px;
+        overflow: hidden;
+    }
+    .prose th, .prose td {
+        padding: 12px 16px;
+        border-bottom: 1px solid #374151;
+        text-align: left;
+        color: #e5e7eb;
+    }
+    .prose th {
+        background-color: #111827;
+        font-weight: 600;
+        text-transform: uppercase;
+        font-size: 0.75rem;
+        letter-spacing: 0.05em;
+        color: #9ca3af;
+    }
+    .prose tr:hover {
+        background-color: #1f2937;
+    }
+    .prose tr:last-child td {
+        border-bottom: none;
+    }
+
+    /* --- CODE BLOCK STYLING --- */
+    .prose pre {
+        background-color: #0d1117 !important;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        padding: 1rem;
+        overflow-x: auto;
+        position: relative;
+        margin: 1.5rem 0;
+    }
+    .prose code {
+        font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        font-size: 0.85rem;
+        color: #e6edf3;
+    }
 </style>
 """
-
-def clean_text(content):
-    if "[SOURCES]" in content:
-        return content.split("[SOURCES]")[0].strip()
-    return content
 
 @ui.page('/')
 def main_page(session: str = None):
@@ -102,13 +167,12 @@ def main_page(session: str = None):
         # Main Chat Area
         with ui.column().classes('flex-grow h-full flex flex-col relative'):
             
-            # JS for tracking scroll position to show/hide the scroll button
+            # JS for tracking scroll AND adding copy buttons to code blocks
             ui.add_head_html('''
                 <script>
                     window.scrollToBottom = function() {
                         const el = document.querySelector('.q-page-container');
                         if (el) el.scrollTop = el.scrollHeight;
-                        // Hide button when we scroll to bottom
                         const btn = document.getElementById('scroll-btn');
                         if (btn) btn.style.display = 'none';
                     };
@@ -124,6 +188,32 @@ def main_page(session: str = None):
                             }
                         }
                     };
+
+                    function addCopyButtons() {
+                        document.querySelectorAll('pre').forEach(pre => {
+                            if (!pre.querySelector('.copy-code-btn')) {
+                                const btn = document.createElement('button');
+                                btn.className = 'copy-code-btn';
+                                btn.style.cssText = 'position:absolute; top:8px; right:8px; background:#374151; color:#e5e7eb; border:none; padding:4px 8px; border-radius:4px; font-size:12px; cursor:pointer; transition: background 0.2s;';
+                                btn.innerText = 'Copy';
+                                btn.onmouseover = () => btn.style.background = '#4b5563';
+                                btn.onmouseout = () => btn.style.background = '#374151';
+                                btn.onclick = () => {
+                                    const code = pre.querySelector('code');
+                                    if (code) {
+                                        navigator.clipboard.writeText(code.innerText).then(() => {
+                                            btn.innerText = 'Copied!';
+                                            setTimeout(() => btn.innerText = 'Copy', 2000);
+                                        });
+                                    }
+                                };
+                                pre.style.position = 'relative';
+                                pre.appendChild(btn);
+                            }
+                        });
+                    }
+
+                    setInterval(addCopyButtons, 1000);
                 </script>
             ''')
 
@@ -151,27 +241,51 @@ def main_page(session: str = None):
                                 with ui.avatar().classes('bg-blue-500'):
                                     ui.label('✦').classes('text-white')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
-                                    display_text = clean_text(m['content'])
+                                    
+                                    raw_content = m['content']
+                                    display_text = raw_content
+                                    urls = []
+                                    
+                                    if "[SOURCES]" in raw_content:
+                                        parts = raw_content.split("[SOURCES]")
+                                        display_text = parts[0].strip()
+                                        if len(parts) > 1:
+                                            urls = [u.strip() for u in parts[1].split("|") if u.strip()]
+
                                     prefix = display_text[:20]
                                     is_err = prefix.startswith("Web search failed") or prefix.startswith("Document error") or prefix.startswith("**Error:**")
                                     color = 'text-red-400' if is_err else 'text-gray-200'
-                                    
                                     ui.markdown(display_text).classes(color)
                                     
-                                    if i == len(msgs) - 1:
-                                        ui.button('Regenerate', on_click=lambda: regenerate()).props('flat dense size=sm color=grey-5').classes('mt-2')
+                                    if urls:
+                                        with ui.expansion(f'🌐 View {len(urls)} Sources', icon='link').classes('w-full text-xs text-gray-400 mt-4 bg-gray-800/50 rounded'):
+                                            for u in urls:
+                                                if u.startswith("http"):
+                                                    ui.link(u, u).classes('text-blue-400 block truncate mb-1 hover:underline')
+                                    
+                                    # --- EXPORT & REGENERATE BUTTONS ---
+                                    with ui.row().classes('mt-2 gap-2 items-center'):
+                                        def download_export(text_content=display_text, idx=i):
+                                            ui.download(text_content.encode('utf-8'), f"nexus_export_{idx}.md")
+                                            
+                                        ui.button('⬇️ Export to Markdown', on_click=download_export)\
+                                            .props('flat dense size=sm color=grey-5')\
+                                            .tooltip('Download this document as a Markdown file')
+                                            
+                                        if i == len(msgs) - 1:
+                                            ui.button('🔄 Regenerate', on_click=lambda: regenerate())\
+                                                .props('flat dense size=sm color=grey-5')
                 
                 ui.run_javascript('setTimeout(scrollToBottom, 200);')
 
             render_chat()
 
-            # Scroll Down Button (Native NiceGUI element)
+            # Scroll Down Button
             scroll_btn = ui.button('↓', on_click=lambda: ui.run_javascript('scrollToBottom()'))\
                 .props('round dense')\
                 .classes('fixed bottom-28 right-[calc(50%-400px)] bg-gray-800 text-gray-400 border border-gray-700 shadow-lg z-50')\
                 .style('display: none;')
                 
-            # Add scroll event listener to the container to trigger checkScroll
             chat_box.on('scroll', lambda: ui.run_javascript('checkScroll()'))
 
             ui.run_javascript('''
@@ -202,23 +316,17 @@ def main_page(session: str = None):
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 rounded-2xl flex-col p-2 border border-gray-700'):
                     
-                    async def handle_native_upload(e):
-                        file_bytes = e.content.read()
-                        if len(file_bytes) > 10 * 1024 * 1024:
-                            ui.notify('File exceeds 10 MB limit.', type='negative')
-                            return
-                        
-                        res = await ui.run.io_bound(ingest_files, [{"name": e.name, "data": base64.b64encode(file_bytes).decode()}], USER_ID)
+                    async def handle_file_event(e):
+                        file_name = e.args['name']
+                        file_data = e.args['data']
+                        res = await ui.run.io_bound(ingest_files, [{"name": file_name, "data": file_data}], USER_ID)
                         ui.notify(res, type='info')
                         with chat_box:
                             with ui.row().classes('w-full justify-center'):
                                 ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
                         ui.run_javascript('setTimeout(scrollToBottom, 100);')
 
-                    # Hidden uploader, controlled via JS
-                    uploader = ui.upload(on_upload=handle_native_upload, auto_upload=True)\
-                        .props('accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx"')\
-                        .classes('hidden-uploader')
+                    ui.on('file_uploaded', handle_file_event)
 
                     input_box = ui.textarea(placeholder='Ask anything — Enter to send, Shift+Enter for new line')\
                         .props('outlined dense autogrow')\
@@ -226,9 +334,27 @@ def main_page(session: str = None):
 
                     with ui.row().classes('w-full justify-between items-center'):
                         with ui.row().classes('gap-2 items-center'):
-                            # Native NiceGUI button that triggers the hidden uploader
-                            ui.button('📎 Attach', on_click=lambda: ui.run_javascript('document.querySelector(".hidden-uploader input").click()'))\
-                                .props('flat dense color=grey-5')
+                            # Native HTML label + input trigger
+                            ui.add_body_html('''
+                                <label class="custom-file-upload">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+                                    <input type="file" id="native-upload" accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" />
+                                </label>
+                                <script>
+                                    document.getElementById('native-upload').addEventListener('change', function(e) {
+                                        const file = e.target.files[0];
+                                        if (file) {
+                                            const reader = new FileReader();
+                                            reader.onload = function(event) {
+                                                const base64Data = event.target.result.split(',')[1];
+                                                emitEvent('file_uploaded', {name: file.name, data: base64Data});
+                                            };
+                                            reader.readAsDataURL(file);
+                                        }
+                                        e.target.value = '';
+                                    });
+                                </script>
+                            ''')
                             
                         with ui.row().classes('gap-2'):
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
@@ -272,7 +398,7 @@ def main_page(session: str = None):
                                     ui.label('✦').classes('text-white')
                                 with ui.column().classes('flex-grow prose prose-invert prose-sm'):
                                     status = ui.label('Thinking...').classes('text-gray-400 italic text-xs')
-                                    holder = ui.column().classes('w-full')
+                                    answer_container = ui.column().classes('w-full')
                         
                         ui.run_javascript('scrollToBottom()')
                         
@@ -283,20 +409,38 @@ def main_page(session: str = None):
                             async for kind, content in ask_agent_v2_stream(prompt, USER_ID):
                                 if kind == "step":
                                     status.text = content
+                                elif kind == "chunk":
+                                    status.visible = False
+                                    got_answer = True
+                                    final += content
+                                    
+                                    visible_text = final.split("[SOURCES]")[0] if "[SOURCES]" in final else final
+                                    
+                                    answer_container.clear()
+                                    with answer_container:
+                                        ui.markdown(visible_text).classes('text-gray-200')
+                                    ui.run_javascript('scrollToBottom()')
                                 elif kind == "answer":
                                     final = content
                                     got_answer = True
                                     status.visible = False
-                                    holder.clear()
+                                    answer_container.clear()
                                     
-                                    display_text = clean_text(final)
-                                    prefix = display_text[:20]
-                                    is_err = prefix.startswith("Web search failed") or prefix.startswith("Document error")
-                                    color = 'text-red-400' if is_err else 'text-gray-200'
-                                    
-                                    with holder:
-                                        ui.markdown(display_text).classes(color)
-                                    ui.run_javascript('scrollToBottom()')
+                                    if "[SOURCES]" in final:
+                                        parts = final.split("[SOURCES]")
+                                        display_text = parts[0].strip()
+                                        urls = [u.strip() for u in parts[1].split("|") if u.strip()]
+                                        
+                                        with answer_container:
+                                            ui.markdown(display_text).classes('text-gray-200')
+                                            with ui.expansion(f'🌐 View {len(urls)} Sources', icon='link').classes('w-full text-xs text-gray-400 mt-4 bg-gray-800/50 rounded'):
+                                                for u in urls:
+                                                    if u.startswith("http"):
+                                                        ui.link(u, u).classes('text-blue-400 block truncate mb-1 hover:underline')
+                                    else:
+                                        with answer_container:
+                                            ui.markdown(final).classes('text-gray-200')
+                                            
                         except asyncio.CancelledError:
                             status.text = 'Stopped.'
                             if not final:
@@ -305,9 +449,9 @@ def main_page(session: str = None):
                         except Exception as e:
                             print(f"AGENT ERROR: {type(e).__name__}: {e}")
                             status.visible = False
-                            holder.clear()
+                            answer_container.clear()
                             err = f"**Error:** {type(e).__name__}: {e}"
-                            with holder:
+                            with answer_container:
                                 ui.markdown(err).classes('text-red-400')
                             final = err
                             got_answer = True
@@ -318,11 +462,23 @@ def main_page(session: str = None):
                         
                         if not got_answer:
                             status.visible = False
-                            holder.clear()
-                            with holder:
+                            answer_container.clear()
+                            with answer_container:
                                 ui.markdown("**No answer was returned.** Check the terminal for errors.").classes('text-red-400')
                             final = "No answer was returned."
                         
+                        # Add Export button to live stream
+                        if got_answer and not final.startswith("**Error"):
+                            clean_export_text = final.split("[SOURCES]")[0].strip() if "[SOURCES]" in final else final
+                            def download_live_export(text_content=clean_export_text):
+                                ui.download(text_content.encode('utf-8'), "nexus_export.md")
+                                
+                            with answer_container:
+                                with ui.row().classes('mt-2 gap-2'):
+                                    ui.button('⬇️ Export to Markdown', on_click=download_live_export)\
+                                        .props('flat dense size=sm color=grey-5')\
+                                        .tooltip('Download this document as a Markdown file')
+
                         save_message(app.storage.user['current_session'], 'assistant', final, USER_ID)
                         msgs = load_messages(app.storage.user['current_session'], USER_ID)
                         if len(msgs) == 2:
@@ -333,6 +489,7 @@ def main_page(session: str = None):
                             cur.execute("UPDATE sessions SET title=? WHERE id=?", (title, app.storage.user['current_session']))
                             c.commit(); c.close()
                         render_sidebar()
+                        # We don't call render_chat() here to avoid the stream flickering on export button insert
 
                     def stop_generation():
                         global current_task
