@@ -24,24 +24,6 @@ GLOBAL_CSS = """
     body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
-    
-    /* Make the native uploader look like a small clean icon */
-    .clean-uploader .q-uploader__header {
-        background: transparent !important;
-        border: none !important;
-        padding: 0 !important;
-        min-height: auto !important;
-        width: auto !important;
-    }
-    .clean-uploader .q-uploader__list { display: none !important; }
-    .clean-uploader .q-uploader__header-content { padding: 0 !important; }
-    .clean-uploader .q-btn {
-        padding: 4px 8px !important;
-        min-height: auto !important;
-        font-size: 0.875rem;
-    }
-    .clean-uploader .q-uploader__title { display: none !important; }
-    .clean-uploader .q-uploader__subtitle { display: none !important; }
 
     /* --- TABLE STYLING (PM Specs) --- */
     .prose table {
@@ -161,7 +143,7 @@ def main_page(session: str = None):
         # Main Chat Area
         with ui.column().classes('flex-grow h-full flex flex-col relative'):
             
-            # JS for tracking scroll AND adding copy buttons to code blocks
+            # JS for tracking scroll AND adding copy buttons
             ui.add_head_html('''
                 <script>
                     window.scrollToBottom = function() {
@@ -323,10 +305,11 @@ def main_page(session: str = None):
                                 ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
                         ui.run_javascript('setTimeout(scrollToBottom, 100);')
 
-                    # Use the clean native uploader
+                    # Create hidden uploader but allow it to be clicked
                     uploader = ui.upload(on_upload=handle_native_upload, auto_upload=True)\
                         .props('accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx"')\
-                        .classes('clean-uploader')
+                        .set_visibility(False)
+                    uploader.ignores_events_when_hidden = False
 
                     input_box = ui.textarea(placeholder='Ask anything — Enter to send, Shift+Enter for new line')\
                         .props('outlined dense autogrow')\
@@ -334,9 +317,9 @@ def main_page(session: str = None):
 
                     with ui.row().classes('w-full justify-between items-center'):
                         with ui.row().classes('gap-2 items-center'):
-                            # The label is clickable and triggers the uploader
-                            ui.label('📎 Attach').classes('text-gray-400 text-sm cursor-pointer hover:text-white')\
-                                .on('click', lambda: uploader.run_method('pickFiles'))
+                            # The custom button triggers the hidden uploader
+                            ui.button('📎 Attach', on_click=lambda: uploader.run_method('pickFiles'))\
+                                .props('flat dense color=grey-5')
                             
                         with ui.row().classes('gap-2'):
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
