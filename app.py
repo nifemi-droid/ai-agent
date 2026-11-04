@@ -25,29 +25,23 @@ GLOBAL_CSS = """
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
     
-    /* Hide the default uploader UI but keep the input functional */
-    .hidden-uploader .q-uploader__header { display: none !important; }
-    .hidden-uploader .q-uploader__list { display: none !important; }
-    .hidden-uploader .q-uploader__input { display: none !important; }
-    
-    /* Style the native file input to look like a clean button */
-    .custom-file-upload {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        cursor: pointer;
-        color: #9ca3af;
-        padding: 8px;
-        border-radius: 50%;
-        transition: background-color 0.2s;
+    /* Make the native uploader look like a small clean icon */
+    .clean-uploader .q-uploader__header {
+        background: transparent !important;
+        border: none !important;
+        padding: 0 !important;
+        min-height: auto !important;
+        width: auto !important;
     }
-    .custom-file-upload:hover {
-        background-color: rgba(255,255,255,0.1);
-        color: #fff;
+    .clean-uploader .q-uploader__list { display: none !important; }
+    .clean-uploader .q-uploader__header-content { padding: 0 !important; }
+    .clean-uploader .q-btn {
+        padding: 4px 8px !important;
+        min-height: auto !important;
+        font-size: 0.875rem;
     }
-    .custom-file-upload input[type="file"] {
-        display: none;
-    }
+    .clean-uploader .q-uploader__title { display: none !important; }
+    .clean-uploader .q-uploader__subtitle { display: none !important; }
 
     /* --- TABLE STYLING (PM Specs) --- */
     .prose table {
@@ -316,17 +310,23 @@ def main_page(session: str = None):
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 rounded-2xl flex-col p-2 border border-gray-700'):
                     
-                    async def handle_file_event(e):
-                        file_name = e.args['name']
-                        file_data = e.args['data']
-                        res = await ui.run.io_bound(ingest_files, [{"name": file_name, "data": file_data}], USER_ID)
+                    async def handle_native_upload(e):
+                        file_bytes = e.content.read()
+                        if len(file_bytes) > 10 * 1024 * 1024:
+                            ui.notify('File exceeds 10 MB limit.', type='negative')
+                            return
+                        
+                        res = await ui.run.io_bound(ingest_files, [{"name": e.name, "data": base64.b64encode(file_bytes).decode()}], USER_ID)
                         ui.notify(res, type='info')
                         with chat_box:
                             with ui.row().classes('w-full justify-center'):
                                 ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
                         ui.run_javascript('setTimeout(scrollToBottom, 100);')
 
-                    ui.on('file_uploaded', handle_file_event)
+                    # Use the clean native uploader
+                    uploader = ui.upload(on_upload=handle_native_upload, auto_upload=True)\
+                        .props('accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx"')\
+                        .classes('clean-uploader')
 
                     input_box = ui.textarea(placeholder='Ask anything — Enter to send, Shift+Enter for new line')\
                         .props('outlined dense autogrow')\
@@ -334,27 +334,9 @@ def main_page(session: str = None):
 
                     with ui.row().classes('w-full justify-between items-center'):
                         with ui.row().classes('gap-2 items-center'):
-                            # Native HTML label + input trigger
-                            ui.add_body_html('''
-                                <label class="custom-file-upload">
-                                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
-                                    <input type="file" id="native-upload" accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" />
-                                </label>
-                                <script>
-                                    document.getElementById('native-upload').addEventListener('change', function(e) {
-                                        const file = e.target.files[0];
-                                        if (file) {
-                                            const reader = new FileReader();
-                                            reader.onload = function(event) {
-                                                const base64Data = event.target.result.split(',')[1];
-                                                emitEvent('file_uploaded', {name: file.name, data: base64Data});
-                                            };
-                                            reader.readAsDataURL(file);
-                                        }
-                                        e.target.value = '';
-                                    });
-                                </script>
-                            ''')
+                            # The label is clickable and triggers the uploader
+                            ui.label('📎 Attach').classes('text-gray-400 text-sm cursor-pointer hover:text-white')\
+                                .on('click', lambda: uploader.run_method('pickFiles'))
                             
                         with ui.row().classes('gap-2'):
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
@@ -489,7 +471,6 @@ def main_page(session: str = None):
                             cur.execute("UPDATE sessions SET title=? WHERE id=?", (title, app.storage.user['current_session']))
                             c.commit(); c.close()
                         render_sidebar()
-                        # We don't call render_chat() here to avoid the stream flickering on export button insert
 
                     def stop_generation():
                         global current_task
