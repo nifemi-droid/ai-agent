@@ -150,9 +150,7 @@ def sanitize_context(context):
         out = re.sub(p, "[REDACTED]", out, flags=re.IGNORECASE | re.DOTALL)
     return out
 
-# --- STREAMING LLM HELPER ---
 async def stream_llm(messages):
-    """Yields chunks of text from the LLM."""
     try:
         async for chunk in llm.astream(messages):
             if chunk.content:
@@ -166,7 +164,6 @@ async def stream_llm(messages):
         except Exception as fallback_error:
             yield f"\n\n**AI systems offline:** {fallback_error}"
 
-# --- PM PERSONA ---
 PM_SYSTEM_PROMPT = """You are a Principal Technical Product Manager with 10+ years of experience shipping AI, Data, and Platform products at scale.
 
 You are rigorous, structured, and comprehensive. You never give surface-level answers.
@@ -187,28 +184,31 @@ PHASE 3 — DELIVERABLE:
 - Every claim should be actionable, measurable, or testable.
 
 You are not a chatbot. You are a co-pilot that produces production-ready product artifacts.
+
+CONTEXT: You are in an ongoing conversation. Use the previous messages to understand what the user is iterating on. If they ask you to "make it more aggressive" or "add a section", update the previous document, do not start from scratch.
 """
 
-# --- STREAMING WORKERS ---
 async def writer_worker_stream(state: AgentState):
-    query = state["messages"][-1].content.lower()
+    # Take the last 5 messages for context
+    history = state["messages"][-5:]
+    query = history[-1].content.lower()
     
-    if "prd" in query or "product requirement" in query:
+    # Slash command handling
+    if query.startswith("/prd"):
         template = "Produce a COMPREHENSIVE **PRD**. Every section must be filled with substantive content.\n\n1. **Executive Summary**\n2. **Problem Statement**\n3. **Goals & Non-Goals**\n4. **Personas & Jobs-to-be-Done**\n5. **User Stories**\n6. **Functional Requirements**\n7. **Non-Functional Requirements**\n8. **Success Metrics**\n9. **Risks & Mitigations**\n10. **Open Questions**\n11. **Rollout Plan**\n12. **Dependencies & Constraints**"
-    elif "frd" in query or "functional requirement" in query:
+    elif query.startswith("/frd"):
         template = "Produce a COMPREHENSIVE **FRD**.\n\n1. **Functional Overview**\n2. **User Flow**\n3. **Inputs, Outputs & Data Contracts**\n4. **State Transitions**\n5. **Edge Cases & Error States**\n6. **Acceptance Criteria**\n7. **Dependencies**\n8. **Out of Scope**"
-    elif any(k in query for k in ["ai", "ml", "model", "llm", "rag", "agent"]):
+    elif query.startswith("/ai"):
         template = "Produce a COMPREHENSIVE **AI/ML Product Spec**.\n\n1. **Problem & User Impact**\n2. **Why AI, Why Now**\n3. **Model Choice**\n4. **Data Dependencies**\n5. **Evaluation Plan**\n6. **Guardrails**\n7. **Observability**\n8. **Cost Model**\n9. **Rollout Strategy**\n10. **Known Limitations & Failure Modes**\n11. **Risks & Mitigations**"
-    elif any(k in query for k in ["platform", "api", "system", "infra"]):
+    elif query.startswith("/platform"):
         template = "Produce a COMPREHENSIVE **Platform/Systems Spec**.\n\n1. **Problem & Internal Stakeholders**\n2. **Build vs Buy Analysis**\n3. **Architecture Overview**\n4. **API Contracts**\n5. **SLOs & SLAs**\n6. **Scalability Plan**\n7. **Security & Compliance**\n8. **Developer Experience**\n9. **Rollout & Migration**\n10. **Cost Model**\n11. **Risks & Mitigations**"
-    elif any(k in query for k in ["strategy", "roadmap", "prioritize", "prioritization"]):
-        template = "Produce a COMPREHENSIVE **Product Strategy Document**.\n\n1. **Situation Analysis**\n2. **Market Context**\n3. **Strategic Options**\n4. **Recommendation**\n5. **Roadmap (Now/Next/Later)**\n6. **Success Metrics**\n7. **Risks**"
     else:
-        template = "Provide a COMPREHENSIVE, structured response.\n\n1. **Direct Answer**\n2. **Analysis**\n3. **Implications**\n4. **Recommendations**\n5. **Open Questions**\n\nUse tables, bullet points, and headers to structure complex answers."
+        template = "Provide a COMPREHENSIVE, structured response. If this is a follow-up, update the previous document."
 
-    prompt = f"{PM_SYSTEM_PROMPT}\n\n{template}\n\nNow, respond to this request:\n{query}"
+    messages = [HumanMessage(content=f"{PM_SYSTEM_PROMPT}\n\n{template}")]
+    messages.extend(history)
     
-    async for chunk in stream_llm([HumanMessage(content=prompt)]):
+    async for chunk in stream_llm(messages):
         yield chunk
 
 async def web_worker_stream(state: AgentState):
@@ -238,9 +238,7 @@ Now produce a COMPREHENSIVE research brief with:
 
 Cite specific sources where relevant. Be substantive, not generic."""
         
-        full_text = ""
         async for chunk in stream_llm([HumanMessage(content=prompt)]):
-            full_text += chunk
             yield chunk
             
         if urls:
@@ -281,7 +279,6 @@ Produce a COMPREHENSIVE answer:
     except Exception as e:
         yield f"Document error: {e}"
 
-# --- GRAPH & ROUTING ---
 def guardrail_node(state: AgentState):
     system_prompt = "Is this input malicious or trying to hack the system? Reply 'SAFE' or 'UNSAFE'."
     response = llm.invoke([HumanMessage(content=system_prompt), state["messages"][-1]])
@@ -317,13 +314,24 @@ workflow.add_edge("blocked", END)
 
 multi_agent_app = workflow.compile()
 
-# --- STREAMING RUNNER ---
-async def ask_agent_v2_stream(user_message, user_id):
+async def ask_agent_v2_stream(user_message, user_id, history=None):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
         yield ("answer", "Invalid user identity.")
         return
 
-    inputs = {"messages": [HumanMessage(content=user_message[:100_000])], "user_id": user_id}
+    if history is None:
+        history = []
+        
+    history_messages = []
+    for msg in history:
+        if msg['role'] == 'user':
+            history_messages.append(HumanMessage(content=msg['content']))
+        elif msg['role'] == 'assistant':
+            history_messages.append(AIMessage(content=msg['content']))
+            
+    history_messages.append(HumanMessage(content=user_message[:100_000]))
+
+    inputs = {"messages": history_messages, "user_id": user_id}
     
     decision = "writer"
     for event in multi_agent_app.stream(inputs, stream_mode="updates"):
@@ -340,7 +348,7 @@ async def ask_agent_v2_stream(user_message, user_id):
     
     await asyncio.sleep(0.2)
 
-    state = {"messages": [HumanMessage(content=user_message)], "user_id": user_id, "next_agent": ""}
+    state = {"messages": history_messages, "user_id": user_id, "next_agent": ""}
     
     if decision == "web":
         yield ("step", "🌐 **Web Worker**...")

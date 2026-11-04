@@ -29,7 +29,7 @@ GLOBAL_CSS = """
     #float-scroll-btn {
         display: none;
         position: fixed;
-        bottom: 120px;
+        bottom: 110px;
         right: calc(50% - 380px);
         width: 36px;
         height: 36px;
@@ -43,10 +43,7 @@ GLOBAL_CSS = """
         z-index: 999;
         transition: all 0.2s;
     }
-    #float-scroll-btn:hover {
-        background-color: #374151;
-        color: #ffffff;
-    }
+    #float-scroll-btn:hover { background-color: #374151; color: #ffffff; }
 
     /* --- TABLE STYLING --- */
     .prose table {
@@ -72,12 +69,8 @@ GLOBAL_CSS = """
         letter-spacing: 0.05em;
         color: #9ca3af;
     }
-    .prose tr:hover {
-        background-color: #1f2937;
-    }
-    .prose tr:last-child td {
-        border-bottom: none;
-    }
+    .prose tr:hover { background-color: #1f2937; }
+    .prose tr:last-child td { border-bottom: none; }
 
     /* --- CODE BLOCK STYLING --- */
     .prose pre {
@@ -305,33 +298,45 @@ def main_page(session: str = None):
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 rounded-2xl flex-col p-2 border border-gray-700'):
                     
-                    async def handle_native_upload(e):
-                        file_bytes = e.content.read()
-                        if len(file_bytes) > 10 * 1024 * 1024:
-                            ui.notify('File exceeds 10 MB limit.', type='negative')
-                            return
-                        
-                        res = await ui.run.io_bound(ingest_files, [{"name": e.name, "data": base64.b64encode(file_bytes).decode()}], USER_ID)
+                    async def handle_file_event(e):
+                        file_name = e.args['name']
+                        file_data = e.args['data']
+                        res = await ui.run.io_bound(ingest_files, [{"name": file_name, "data": file_data}], USER_ID)
                         ui.notify(res, type='info')
                         with chat_box:
                             with ui.row().classes('w-full justify-center'):
                                 ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
                         ui.run_javascript('setTimeout(scrollToBottom, 100);')
 
-                    # Create uploader, then hide it separately
-                    uploader = ui.upload(on_upload=handle_native_upload, auto_upload=True)\
-                        .props('accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx"')
-
-                    uploader.set_visibility(False)
-                    uploader.ignores_events_when_hidden = False
+                    ui.on('file_uploaded', handle_file_event)
 
                     input_box = ui.textarea(placeholder='Ask anything — Enter to send, Shift+Enter for new line')\
                         .props('outlined dense autogrow')\
-                        .classes('w-full bg-transparent text-white')
+                        .classes('w-full bg-transparent text-white pl-10')
 
                     with ui.row().classes('w-full justify-between items-center'):
                         with ui.row().classes('gap-2 items-center'):
-                            ui.button('📎 Attach', on_click=lambda: uploader.run_method('pickFiles')).props('flat dense color=grey-5')
+                            # Native HTML label + input trigger
+                            ui.add_body_html('''
+                                <label class="custom-file-upload" id="html-attach-label" style="position: absolute; bottom: 82px; left: 22px; z-index: 1000; cursor: pointer; color: #9ca3af;">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+                                    <input type="file" id="native-upload" accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" style="display: none;" />
+                                </label>
+                                <script>
+                                    document.getElementById('native-upload').addEventListener('change', function(e) {
+                                        const file = e.target.files[0];
+                                        if (file) {
+                                            const reader = new FileReader();
+                                            reader.onload = function(event) {
+                                                const base64Data = event.target.result.split(',')[1];
+                                                emitEvent('file_uploaded', {name: file.name, data: base64Data});
+                                            };
+                                            reader.readAsDataURL(file);
+                                        }
+                                        e.target.value = '';
+                                    });
+                                </script>
+                            ''')
                             
                         with ui.row().classes('gap-2'):
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
@@ -351,12 +356,16 @@ def main_page(session: str = None):
                         if not allowed:
                             ui.notify('Rate limit exceeded. Wait 60s.', type='negative')
                             return
+                        
+                        # Get history BEFORE saving the new message
+                        history = load_messages(app.storage.user['current_session'], USER_ID)
+                        
                         input_box.value = ''
                         save_message(app.storage.user['current_session'], 'user', prompt, USER_ID)
                         
                         with chat_box:
                             with ui.row().classes('w-full justify-end items-start gap-2'):
-                                idx = len(load_messages(app.storage.user['current_session'], USER_ID)) - 1
+                                idx = len(history)
                                 ui.button('Edit', on_click=lambda idx=idx, c=prompt: edit_prompt(idx, c)).props('flat dense size=sm color=grey-5')
                                 with ui.card().classes('bg-blue-600 text-white rounded-2xl max-w-[80%] px-4 py-2'):
                                     ui.markdown(prompt)
@@ -383,7 +392,9 @@ def main_page(session: str = None):
                         got_answer = False
                         try:
                             current_task = asyncio.current_task()
-                            async for kind, content in ask_agent_v2_stream(prompt, USER_ID):
+                            # Pass history to the agent
+                            history = load_messages(app.storage.user['current_session'], USER_ID)
+                            async for kind, content in ask_agent_v2_stream(prompt, USER_ID, history):
                                 if kind == "step":
                                     status.text = content
                                 elif kind == "chunk":
