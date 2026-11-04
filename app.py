@@ -26,18 +26,20 @@ GLOBAL_CSS = """
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
     
-    /* Style the native file input to look like a button */
+    /* Native file input styled as a clean icon */
     .custom-file-upload {
-        display: inline-block;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         cursor: pointer;
         color: #9ca3af;
-        padding: 4px 8px;
-        font-size: 0.875rem;
-        border-radius: 4px;
+        padding: 8px;
+        border-radius: 50%;
         transition: background-color 0.2s;
     }
     .custom-file-upload:hover {
-        background-color: rgba(255,255,255,0.05);
+        background-color: rgba(255,255,255,0.1);
+        color: #fff;
     }
     .custom-file-upload input[type="file"] {
         display: none;
@@ -46,7 +48,6 @@ GLOBAL_CSS = """
 """
 
 def clean_text(content):
-    """Removes the [SOURCES] tag and everything after it."""
     if "[SOURCES]" in content:
         return content.split("[SOURCES]")[0].strip()
     return content
@@ -66,6 +67,30 @@ def main_page(session: str = None):
             app.storage.user['current_session'] = valid_sessions[0]
         else:
             app.storage.user['current_session'] = create_session(USER_ID, "New Chat")
+
+    # --- SCROLL DOWN JS ---
+    ui.add_head_html('''
+        <script>
+            window.scrollToBottom = function() {
+                const el = document.querySelector('.q-page-container');
+                if (el) el.scrollTop = el.scrollHeight;
+                const btn = document.getElementById('scroll-btn');
+                if (btn) btn.style.display = 'none';
+            };
+            
+            window.checkScroll = function() {
+                const el = document.querySelector('.q-page-container');
+                const btn = document.getElementById('scroll-btn');
+                if (el && btn) {
+                    if (el.scrollHeight - el.scrollTop - el.clientHeight > 200) {
+                        btn.style.display = 'flex';
+                    } else {
+                        btn.style.display = 'none';
+                    }
+                }
+            };
+        </script>
+    ''')
 
     # Header
     with ui.header().classes('bg-gray-900 border-b border-gray-800 px-4 py-2 items-center justify-between'):
@@ -117,10 +142,44 @@ def main_page(session: str = None):
 
             render_sidebar()
 
-        # Main
+        # Main Chat Area
         with ui.column().classes('flex-grow h-full flex flex-col relative'):
-            chat_box = ui.column().classes('w-full max-w-3xl mx-auto gap-4 overflow-y-auto flex-grow p-4 pb-40')
+            
+            # Scroll Down Button (Floating)
+            ui.add_body_html('''
+                <style>
+                    #scroll-btn {
+                        display: none;
+                        position: fixed;
+                        bottom: 110px;
+                        right: calc(50% - 400px);
+                        width: 36px;
+                        height: 36px;
+                        border-radius: 50%;
+                        background: #1f2937;
+                        border: 1px solid #374151;
+                        color: #9ca3af;
+                        align-items: center;
+                        justify-content: center;
+                        cursor: pointer;
+                        z-index: 999;
+                        transition: all 0.2s;
+                    }
+                    #scroll-btn:hover {
+                        background: #374151;
+                        color: #fff;
+                    }
+                </style>
+                <button id="scroll-btn" onclick="scrollToBottom()">↓</button>
+                <script>
+                    document.addEventListener('scroll', function(e) {
+                        if(e.target.classList.contains('q-page-container')) checkScroll();
+                    }, true);
+                </script>
+            ''')
 
+            chat_box = ui.column().classes('w-full max-w-3xl mx-auto gap-4 overflow-y-auto flex-grow p-4 pb-40').on('scroll', lambda: ui.run_javascript('checkScroll()'))
+            
             def render_chat():
                 chat_box.clear()
                 msgs = load_messages(app.storage.user['current_session'], USER_ID)
@@ -144,7 +203,6 @@ def main_page(session: str = None):
                                     ui.label('✦').classes('text-white')
                                 with ui.column().classes('flex-grow max-w-[85%] prose prose-invert prose-sm'):
                                     display_text = clean_text(m['content'])
-                                    
                                     prefix = display_text[:20]
                                     is_err = prefix.startswith("Web search failed") or prefix.startswith("Document error") or prefix.startswith("**Error:**")
                                     color = 'text-red-400' if is_err else 'text-gray-200'
@@ -154,17 +212,10 @@ def main_page(session: str = None):
                                     if i == len(msgs) - 1:
                                         ui.button('Regenerate', on_click=lambda: regenerate()).props('flat dense size=sm color=grey-5').classes('mt-2')
                 
-                # Delayed scroll to bottom after DOM renders
-                ui.run_javascript('''
-                    setTimeout(function() {
-                        const el = document.querySelector('.q-page-container');
-                        if (el) el.scrollTop = el.scrollHeight;
-                    }, 300); 
-                ''')
+                ui.run_javascript('setTimeout(scrollToBottom, 100);')
 
             render_chat()
 
-            # Delayed auto-focus on the input box
             ui.run_javascript('''
                 setTimeout(function() {
                     const input = document.querySelector('textarea');
@@ -189,7 +240,7 @@ def main_page(session: str = None):
                 if prompt:
                     await run_agent(prompt)
 
-            # Input
+            # Input Area
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 rounded-2xl flex-col p-2 border border-gray-700'):
                     
@@ -201,37 +252,38 @@ def main_page(session: str = None):
                         with chat_box:
                             with ui.row().classes('w-full justify-center'):
                                 ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
+                        ui.run_javascript('setTimeout(scrollToBottom, 100);')
 
                     ui.on('file_uploaded', handle_file_event)
 
-                    # Hidden native HTML input with a custom label
-                    ui.add_body_html('''
-                        <label class="custom-file-upload" style="position: absolute; bottom: 15px; left: 15px; z-index: 100;">
-                            📎 Attach
-                            <input type="file" id="native-upload" accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" />
-                        </label>
-                        <script>
-                            document.getElementById('native-upload').addEventListener('change', function(e) {
-                                const file = e.target.files[0];
-                                if (file) {
-                                    const reader = new FileReader();
-                                    reader.onload = function(event) {
-                                        const base64Data = event.target.result.split(',')[1];
-                                        emitEvent('file_uploaded', {name: file.name, data: base64Data});
-                                    };
-                                    reader.readAsDataURL(file);
-                                }
-                                e.target.value = '';
-                            });
-                        </script>
-                    ''')
-
-                    # The textarea (with padding to make room for the absolute Attach button)
                     input_box = ui.textarea(placeholder='Ask anything — Enter to send, Shift+Enter for new line')\
                         .props('outlined dense autogrow')\
-                        .classes('w-full bg-transparent text-white pl-24')
+                        .classes('w-full bg-transparent text-white')
 
-                    with ui.row().classes('w-full justify-end items-center'):
+                    with ui.row().classes('w-full justify-between items-center'):
+                        with ui.row().classes('gap-2 items-center'):
+                            # Reliable HTML label + input trigger
+                            ui.add_body_html('''
+                                <label class="custom-file-upload">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+                                    <input type="file" id="native-upload" accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" />
+                                </label>
+                                <script>
+                                    document.getElementById('native-upload').addEventListener('change', function(e) {
+                                        const file = e.target.files[0];
+                                        if (file) {
+                                            const reader = new FileReader();
+                                            reader.onload = function(event) {
+                                                const base64Data = event.target.result.split(',')[1];
+                                                emitEvent('file_uploaded', {name: file.name, data: base64Data});
+                                            };
+                                            reader.readAsDataURL(file);
+                                        }
+                                        e.target.value = ''; // Clear input for next upload
+                                    });
+                                </script>
+                            ''')
+                            
                         with ui.row().classes('gap-2'):
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
                             send_btn = ui.button('Send', on_click=lambda: send()).props('flat dense color=blue-400')
@@ -259,7 +311,7 @@ def main_page(session: str = None):
                                 ui.button('Edit', on_click=lambda idx=idx, c=prompt: edit_prompt(idx, c)).props('flat dense size=sm color=grey-5')
                                 with ui.card().classes('bg-blue-600 text-white rounded-2xl max-w-[80%] px-4 py-2'):
                                     ui.markdown(prompt)
-                        ui.run_javascript('const e=document.querySelector(".q-page-container"); if(e) e.scrollTop=e.scrollHeight;')
+                        ui.run_javascript('scrollToBottom()')
                         
                         await run_agent(prompt)
 
@@ -276,7 +328,7 @@ def main_page(session: str = None):
                                     status = ui.label('Thinking...').classes('text-gray-400 italic text-xs')
                                     holder = ui.column().classes('w-full')
                         
-                        ui.run_javascript('const e=document.querySelector(".q-page-container"); if(e) e.scrollTop=e.scrollHeight;')
+                        ui.run_javascript('scrollToBottom()')
                         
                         final = ""
                         got_answer = False
@@ -298,7 +350,7 @@ def main_page(session: str = None):
                                     
                                     with holder:
                                         ui.markdown(display_text).classes(color)
-                                    ui.run_javascript('const e=document.querySelector(".q-page-container"); if(e) e.scrollTop=e.scrollHeight;')
+                                    ui.run_javascript('scrollToBottom()')
                         except asyncio.CancelledError:
                             status.text = 'Stopped.'
                             if not final:
