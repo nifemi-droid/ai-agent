@@ -26,24 +26,10 @@ GLOBAL_CSS = """
     ::-webkit-scrollbar { width: 6px; }
     ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
     
-    /* Native file input styled as a clean icon */
-    .custom-file-upload {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        cursor: pointer;
-        color: #9ca3af;
-        padding: 8px;
-        border-radius: 50%;
-        transition: background-color 0.2s;
-    }
-    .custom-file-upload:hover {
-        background-color: rgba(255,255,255,0.1);
-        color: #fff;
-    }
-    .custom-file-upload input[type="file"] {
-        display: none;
-    }
+    /* Hide the uploader's default UI but keep the input */
+    .hidden-uploader .q-uploader__header { display: none !important; }
+    .hidden-uploader .q-uploader__list { display: none !important; }
+    .hidden-uploader .q-uploader__input { display: none !important; }
 </style>
 """
 
@@ -67,30 +53,6 @@ def main_page(session: str = None):
             app.storage.user['current_session'] = valid_sessions[0]
         else:
             app.storage.user['current_session'] = create_session(USER_ID, "New Chat")
-
-    # --- SCROLL DOWN JS ---
-    ui.add_head_html('''
-        <script>
-            window.scrollToBottom = function() {
-                const el = document.querySelector('.q-page-container');
-                if (el) el.scrollTop = el.scrollHeight;
-                const btn = document.getElementById('scroll-btn');
-                if (btn) btn.style.display = 'none';
-            };
-            
-            window.checkScroll = function() {
-                const el = document.querySelector('.q-page-container');
-                const btn = document.getElementById('scroll-btn');
-                if (el && btn) {
-                    if (el.scrollHeight - el.scrollTop - el.clientHeight > 200) {
-                        btn.style.display = 'flex';
-                    } else {
-                        btn.style.display = 'none';
-                    }
-                }
-            };
-        </script>
-    ''')
 
     # Header
     with ui.header().classes('bg-gray-900 border-b border-gray-800 px-4 py-2 items-center justify-between'):
@@ -145,40 +107,32 @@ def main_page(session: str = None):
         # Main Chat Area
         with ui.column().classes('flex-grow h-full flex flex-col relative'):
             
-            # Scroll Down Button (Floating)
-            ui.add_body_html('''
-                <style>
-                    #scroll-btn {
-                        display: none;
-                        position: fixed;
-                        bottom: 110px;
-                        right: calc(50% - 400px);
-                        width: 36px;
-                        height: 36px;
-                        border-radius: 50%;
-                        background: #1f2937;
-                        border: 1px solid #374151;
-                        color: #9ca3af;
-                        align-items: center;
-                        justify-content: center;
-                        cursor: pointer;
-                        z-index: 999;
-                        transition: all 0.2s;
-                    }
-                    #scroll-btn:hover {
-                        background: #374151;
-                        color: #fff;
-                    }
-                </style>
-                <button id="scroll-btn" onclick="scrollToBottom()">↓</button>
+            # JS for tracking scroll position to show/hide the scroll button
+            ui.add_head_html('''
                 <script>
-                    document.addEventListener('scroll', function(e) {
-                        if(e.target.classList.contains('q-page-container')) checkScroll();
-                    }, true);
+                    window.scrollToBottom = function() {
+                        const el = document.querySelector('.q-page-container');
+                        if (el) el.scrollTop = el.scrollHeight;
+                        // Hide button when we scroll to bottom
+                        const btn = document.getElementById('scroll-btn');
+                        if (btn) btn.style.display = 'none';
+                    };
+                    
+                    window.checkScroll = function() {
+                        const el = document.querySelector('.q-page-container');
+                        const btn = document.getElementById('scroll-btn');
+                        if (el && btn) {
+                            if (el.scrollHeight - el.scrollTop - el.clientHeight > 200) {
+                                btn.style.display = 'flex';
+                            } else {
+                                btn.style.display = 'none';
+                            }
+                        }
+                    };
                 </script>
             ''')
 
-            chat_box = ui.column().classes('w-full max-w-3xl mx-auto gap-4 overflow-y-auto flex-grow p-4 pb-40').on('scroll', lambda: ui.run_javascript('checkScroll()'))
+            chat_box = ui.column().classes('w-full max-w-3xl mx-auto gap-4 overflow-y-auto flex-grow p-4 pb-40')
             
             def render_chat():
                 chat_box.clear()
@@ -212,9 +166,18 @@ def main_page(session: str = None):
                                     if i == len(msgs) - 1:
                                         ui.button('Regenerate', on_click=lambda: regenerate()).props('flat dense size=sm color=grey-5').classes('mt-2')
                 
-                ui.run_javascript('setTimeout(scrollToBottom, 100);')
+                ui.run_javascript('setTimeout(scrollToBottom, 200);')
 
             render_chat()
+
+            # Scroll Down Button (Native NiceGUI element)
+            scroll_btn = ui.button('↓', on_click=lambda: ui.run_javascript('scrollToBottom()'))\
+                .props('round dense')\
+                .classes('fixed bottom-28 right-[calc(50%-400px)] bg-gray-800 text-gray-400 border border-gray-700 shadow-lg z-50')\
+                .style('display: none;')
+                
+            # Add scroll event listener to the container to trigger checkScroll
+            chat_box.on('scroll', lambda: ui.run_javascript('checkScroll()'))
 
             ui.run_javascript('''
                 setTimeout(function() {
@@ -244,17 +207,23 @@ def main_page(session: str = None):
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
                 with ui.card().classes('w-full bg-gray-800 rounded-2xl flex-col p-2 border border-gray-700'):
                     
-                    async def handle_file_event(e):
-                        file_name = e.args['name']
-                        file_data = e.args['data']
-                        res = await ui.run.io_bound(ingest_files, [{"name": file_name, "data": file_data}], USER_ID)
+                    async def handle_native_upload(e):
+                        file_bytes = e.content.read()
+                        if len(file_bytes) > 10 * 1024 * 1024:
+                            ui.notify('File exceeds 10 MB limit.', type='negative')
+                            return
+                        
+                        res = await ui.run.io_bound(ingest_files, [{"name": e.name, "data": base64.b64encode(file_bytes).decode()}], USER_ID)
                         ui.notify(res, type='info')
                         with chat_box:
                             with ui.row().classes('w-full justify-center'):
                                 ui.badge(f"📁 {res}", color='gray-700').classes('text-gray-300 text-xs')
                         ui.run_javascript('setTimeout(scrollToBottom, 100);')
 
-                    ui.on('file_uploaded', handle_file_event)
+                    # Hidden uploader, controlled via JS
+                    uploader = ui.upload(on_upload=handle_native_upload, auto_upload=True)\
+                        .props('accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx"')\
+                        .classes('hidden-uploader')
 
                     input_box = ui.textarea(placeholder='Ask anything — Enter to send, Shift+Enter for new line')\
                         .props('outlined dense autogrow')\
@@ -262,27 +231,9 @@ def main_page(session: str = None):
 
                     with ui.row().classes('w-full justify-between items-center'):
                         with ui.row().classes('gap-2 items-center'):
-                            # Reliable HTML label + input trigger
-                            ui.add_body_html('''
-                                <label class="custom-file-upload">
-                                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
-                                    <input type="file" id="native-upload" accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" />
-                                </label>
-                                <script>
-                                    document.getElementById('native-upload').addEventListener('change', function(e) {
-                                        const file = e.target.files[0];
-                                        if (file) {
-                                            const reader = new FileReader();
-                                            reader.onload = function(event) {
-                                                const base64Data = event.target.result.split(',')[1];
-                                                emitEvent('file_uploaded', {name: file.name, data: base64Data});
-                                            };
-                                            reader.readAsDataURL(file);
-                                        }
-                                        e.target.value = ''; // Clear input for next upload
-                                    });
-                                </script>
-                            ''')
+                            # Native NiceGUI button that triggers the hidden uploader
+                            ui.button('📎 Attach', on_click=lambda: ui.run_javascript('document.querySelector(".hidden-uploader input").click()'))\
+                                .props('flat dense color=grey-5')
                             
                         with ui.row().classes('gap-2'):
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
