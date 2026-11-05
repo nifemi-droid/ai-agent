@@ -7,32 +7,53 @@ ensure_dbs_exist()
 @cl.on_chat_start
 async def on_chat_start():
     """Called when a new chat session starts."""
-    # Initialize the chat history for this session
     cl.user_session.set("history", [])
+    cl.user_session.set("verbose_mode", False)
+    cl.user_session.set("show_sources", True)
     
-    # Initialize settings (if you want to add custom PM settings later)
-    settings = await cl.ChatSettings(
-        [
-            cl.input_widget.Switch(id="show_sources", label="Show Sources", initial=True),
-            cl.input_widget.Switch(id="verbose_mode", label="Verbose Mode (Debug)", initial=False),
-        ]
-    ).send()
+    # Send a welcome message with a Settings button
+    actions = [
+        cl.Action(name="open_settings", value="open", label="⚙️ Settings", payload={})
+    ]
     
-    cl.user_session.set("settings", settings)
-    
-    # Send a welcome message
     await cl.Message(
         content="✦ **Nexus** — Your Technical PM Co-pilot.\n\n"
                 "Ask me to write a PRD, research a market, or analyze a document. "
-                "Use the attach button below to upload a PDF, DOCX, or CSV."
+                "Use the attach button below to upload a PDF, DOCX, or CSV.",
+        actions=actions
     ).send()
 
 
-@cl.on_settings_update
-async def setup_agent(settings):
-    """Called when the user changes settings."""
-    cl.user_session.set("settings", settings)
-    await cl.Message(content="Settings updated.").send()
+@cl.action_callback("open_settings")
+async def on_settings_action(action: cl.Action):
+    """Renders the current settings and toggle buttons."""
+    verbose = cl.user_session.get("verbose_mode", False)
+    sources = cl.user_session.get("show_sources", True)
+    
+    await cl.Message(
+        content=f"**Current Settings**\n\n"
+                f"- Agent Routing (Verbose): {'ON' if verbose else 'OFF'}\n"
+                f"- Show Sources: {'ON' if sources else 'OFF'}",
+        actions=[
+            cl.Action(name="toggle_verbose", value="toggle", label=f"Toggle Routing ({'ON' if verbose else 'OFF'})", payload={}),
+            cl.Action(name="toggle_sources", value="toggle", label=f"Toggle Sources ({'ON' if sources else 'OFF'})", payload={}),
+            cl.Action(name="close_settings", value="close", label="Close", payload={}),
+        ]
+    ).send()
+
+
+@cl.action_callback("toggle_verbose")
+async def on_toggle_verbose(action: cl.Action):
+    current = cl.user_session.get("verbose_mode", False)
+    cl.user_session.set("verbose_mode", not current)
+    await cl.Message(content=f"Agent Routing is now **{'ON' if not current else 'OFF'}**.").send()
+
+
+@cl.action_callback("toggle_sources")
+async def on_toggle_sources(action: cl.Action):
+    current = cl.user_session.get("show_sources", True)
+    cl.user_session.set("show_sources", not current)
+    await cl.Message(content=f"Show Sources is now **{'ON' if not current else 'OFF'}**.").send()
 
 
 @cl.on_message
@@ -41,10 +62,12 @@ async def on_message(message: cl.Message):
     
     user_id = "local"
     # Chainlit gives each chat session a unique ID. 
-    # Clicking "New Chat" in the UI generates a new session_id, isolating documents.
+    # Clicking "New Chat" isolates the documents via this ID.
     session_id = cl.context.session.id
     history = cl.user_session.get("history") or []
-    settings = cl.user_session.get("settings") or {"show_sources": True, "verbose_mode": False}
+    
+    verbose_mode = cl.user_session.get("verbose_mode", False)
+    show_sources = cl.user_session.get("show_sources", True)
 
     # 1. Handle file attachments
     if message.elements:
@@ -61,14 +84,12 @@ async def on_message(message: cl.Message):
                 })
         
         if files_to_ingest:
-            # Show a subtle message that ingestion is happening
             msg = cl.Message(content=f"📁 Processing {len(files_to_ingest)} file(s)...")
             await msg.send()
             
             # Call existing ingest_files with the session-scoped ID
             res = await cl.make_async(ingest_files)(files_to_ingest, user_id, session_id)
             
-            # Update the message with the result
             msg.content = res
             await msg.update()
             
@@ -91,8 +112,8 @@ async def on_message(message: cl.Message):
             message.content, user_id, history, session_id
         ):
             if kind == "step":
-                # SILENTLY LOG TO TERMINAL (For debugging)
-                if settings.get("verbose_mode", False):
+                # If verbose mode is on, show the step. Otherwise, log to terminal silently.
+                if verbose_mode:
                     await cl.Message(content=f"_{content}_").send()
                 else:
                     print(f"[Internal Routing]: {content}")
@@ -117,8 +138,13 @@ async def on_message(message: cl.Message):
 
     await final_answer.update()
     
-    # 4. Update the conversation history for the next turn
-    # This is what makes the bot remember context within the SAME chat.
+    # 4. Clean up sources if the user has toggled them OFF
+    if not show_sources and "[SOURCES]" in final_answer.content:
+        clean_text = final_answer.content.split("[SOURCES]")[0].strip()
+        final_answer.content = clean_text
+        await final_answer.update()
+    
+    # 5. Update the conversation history for the next turn
     history.append({"role": "user", "content": message.content})
     history.append({"role": "assistant", "content": final_answer.content})
     cl.user_session.set("history", history)
@@ -127,6 +153,6 @@ async def on_message(message: cl.Message):
 @cl.on_chat_resume
 async def on_chat_resume(thread):
     """Called when a user resumes an old chat from the sidebar."""
-    # Chainlit automatically handles the session state for resumed chats, 
-    # but we initialize history to be safe.
     cl.user_session.set("history", [])
+    cl.user_session.set("verbose_mode", False)
+    cl.user_session.set("show_sources", True)
