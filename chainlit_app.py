@@ -64,22 +64,20 @@ async def on_message(message: cl.Message):
     if not message.content or message.content.strip() == "":
         return
 
-    # 3. Stream the agent response
+        # 3. Stream the agent response silently
     final_answer = cl.Message(content="")
     await final_answer.send()
     
     got_answer = False
     
     try:
-        # Call your existing streaming function, passing the session-scoped ID
         async for kind, content in ask_agent_v2_stream(
             message.content, user_id, history, session_id
         ):
             if kind == "step":
-                # Show the routing step as a collapsible panel
-                async with cl.Step(name=content, type="tool") as step:
-                    step.output = "Running..."
-                    await step.update()
+                # SILENTLY LOG TO TERMINAL (For debugging)
+                print(f"[Internal Routing]: {content}")
+                # We do NOT send this to the UI anymore.
                     
             elif kind == "chunk":
                 got_answer = True
