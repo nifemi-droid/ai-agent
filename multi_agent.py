@@ -6,7 +6,7 @@ import time
 from typing import TypedDict, Annotated, Sequence
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 import operator
 from tavily import TavilyClient
@@ -43,10 +43,10 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     next_agent: str
     user_id: str
-    session_id: str # NEW: Tracks the current chat session
+    session_id: str
 
-llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, api_key=GROQ_KEY)
-fallback_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.3, api_key=GROQ_KEY)
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.2, api_key=GROQ_KEY)
+fallback_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.2, api_key=GROQ_KEY)
 
 def generate_chat_title(prompt):
     try:
@@ -84,7 +84,6 @@ def _extract_text(file_bytes: bytes, file_name: str) -> str:
         return ""
     return ""
 
-# CHANGED: Added session_id to scope documents per chat
 def ingest_files(files, user_id, session_id):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
         return "Upload rejected: invalid identity."
@@ -125,7 +124,6 @@ def ingest_files(files, user_id, session_id):
 
     embeddings = embedding_model.encode(all_chunks).tolist()
     
-    # CHANGED: Unique collection for this specific chat session
     collection_name = f"docs_{user_id}_{session_id}"
     try:
         chroma_client.delete_collection(name=collection_name)
@@ -170,49 +168,77 @@ async def stream_llm(messages):
         except Exception as fallback_error:
             yield f"\n\n**AI systems offline:** {fallback_error}"
 
-PM_SYSTEM_PROMPT = """You are a Principal Technical Product Manager with 10+ years of experience shipping AI, Data, and Platform products at scale.
+# --- INDUSTRY STANDARD PM PERSONA ---
+PM_SYSTEM_PROMPT = """You are a Principal Technical Product Manager with 10+ years of experience at top-tier tech companies (Google, Stripe, OpenAI). 
 
-You are rigorous, structured, and comprehensive. You never give surface-level answers.
+You are known for producing rigorous, data-driven, and comprehensive product artifacts. You never give surface-level answers.
 
-You ALWAYS reason in three phases before responding:
-PHASE 1 — ANALYSIS (do this silently):
-- What is the user actually asking for? What is the underlying problem?
-- Who are the stakeholders and what do they care about?
-- What assumptions am I making? What would a senior PM flag as a risk?
-
-PHASE 2 — STRUCTURE:
-- Select the appropriate framework for the artifact being requested.
-- Plan the sections before writing.
-
-PHASE 3 — DELIVERABLE:
-- Write the artifact in clean, structured Markdown.
-- Be comprehensive but not verbose. No filler words. No "Great question!"
-- Every claim should be actionable, measurable, or testable.
-
-You are not a chatbot. You are a co-pilot that produces production-ready product artifacts.
-
-CONTEXT: You are in an ongoing conversation. Use the previous messages to understand what the user is iterating on. If they ask you to "make it more aggressive" or "add a section", update the previous document, do not start from scratch.
+INDUSTRY STANDARD REQUIREMENTS:
+1. Always structure your reasoning. Before writing, outline the logical flow.
+2. Use frameworks: RICE for prioritization, INVEST for user stories, SMART for goals.
+3. For AI/ML products, always include: model choice rationale, eval metrics, guardrails, and cost modeling.
+4. For Platform products, always include: API contracts, SLOs/SLAs, and Build vs. Buy analysis.
+5. Be concise but substantive. No filler words. Every sentence must add value.
 """
 
+# --- PROMPT CHAINING (THE SECRET SAUCE) ---
 async def writer_worker_stream(state: AgentState):
     history = state["messages"][-5:]
     query = history[-1].content.lower()
     
-    if query.startswith("/prd"):
-        template = "Produce a COMPREHENSIVE **PRD**. Every section must be filled with substantive content.\n\n1. **Executive Summary**\n2. **Problem Statement**\n3. **Goals & Non-Goals**\n4. **Personas & Jobs-to-be-Done**\n5. **User Stories**\n6. **Functional Requirements**\n7. **Non-Functional Requirements**\n8. **Success Metrics**\n9. **Risks & Mitigations**\n10. **Open Questions**\n11. **Rollout Plan**\n12. **Dependencies & Constraints**"
-    elif query.startswith("/frd"):
-        template = "Produce a COMPREHENSIVE **FRD**.\n\n1. **Functional Overview**\n2. **User Flow**\n3. **Inputs, Outputs & Data Contracts**\n4. **State Transitions**\n5. **Edge Cases & Error States**\n6. **Acceptance Criteria**\n7. **Dependencies**\n8. **Out of Scope**"
-    elif query.startswith("/ai"):
-        template = "Produce a COMPREHENSIVE **AI/ML Product Spec**.\n\n1. **Problem & User Impact**\n2. **Why AI, Why Now**\n3. **Model Choice**\n4. **Data Dependencies**\n5. **Evaluation Plan**\n6. **Guardrails**\n7. **Observability**\n8. **Cost Model**\n9. **Rollout Strategy**\n10. **Known Limitations & Failure Modes**\n11. **Risks & Mitigations**"
-    elif query.startswith("/platform"):
-        template = "Produce a COMPREHENSIVE **Platform/Systems Spec**.\n\n1. **Problem & Internal Stakeholders**\n2. **Build vs Buy Analysis**\n3. **Architecture Overview**\n4. **API Contracts**\n5. **SLOs & SLAs**\n6. **Scalability Plan**\n7. **Security & Compliance**\n8. **Developer Experience**\n9. **Rollout & Migration**\n10. **Cost Model**\n11. **Risks & Mitigations**"
+    # Step 1: Determine the framework/artifact type
+    if "prd" in query or "product requirement" in query:
+        artifact_type = "PRD"
+        framework = "Problem, Goals, Non-Goals, Personas, User Stories (INVEST), Functional Requirements, Non-Functional Requirements, Success Metrics (SMART), Risks, Rollout Plan"
+    elif "frd" in query or "functional requirement" in query:
+        artifact_type = "FRD"
+        framework = "Functional Overview, User Flow, Data Contracts, State Transitions, Edge Cases, Acceptance Criteria"
+    elif any(k in query for k in ["ai", "ml", "model", "llm", "rag"]):
+        artifact_type = "AI/ML Spec"
+        framework = "Problem, Model Choice, Data Dependencies, Evaluation Plan (Hallucination, Latency, Cost), Guardrails, Observability, Rollout Strategy"
+    elif any(k in query for k in ["platform", "api", "system"]):
+        artifact_type = "Platform Spec"
+        framework = "Problem, Build vs Buy, API Contracts, SLOs/SLAs, Scalability, DX, Migration"
     else:
-        template = "Provide a COMPREHENSIVE, structured response. If this is a follow-up, update the previous document."
+        artifact_type = "Product Strategy"
+        framework = "Situation Analysis, Market Context, Options, Recommendation, Roadmap, Risks"
 
-    messages = [HumanMessage(content=f"{PM_SYSTEM_PROMPT}\n\n{template}")]
-    messages.extend(history)
+    # --- STEP 1: DRAFT (Think First) ---
+    draft_prompt = f"""
+    You are drafting the core sections of a {artifact_type}.
+    Framework to follow: {framework}.
     
-    async for chunk in stream_llm(messages):
+    User Request: {query}
+    
+    Think step-by-step. Outline the key points for each section. Do not write the full document yet. 
+    Provide a structured outline with bullet points for the key arguments.
+    """
+    
+    messages_draft = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=draft_prompt)]
+    draft_text = ""
+    async for chunk in stream_llm(messages_draft):
+        draft_text += chunk
+
+    # --- STEP 2: REFINE & FINALIZE (The Industry Standard Output) ---
+    refine_prompt = f"""
+    You are finalizing a {artifact_type} based on the outline below.
+    
+    Outline:
+    {draft_text}
+    
+    Instructions:
+    1. Expand the outline into a full, comprehensive Markdown document.
+    2. Ensure every section from the framework is present: {framework}.
+    3. Use professional PM language. Be specific. Include tables where appropriate (e.g., Requirements, Metrics).
+    4. Do not use filler. Start directly with the Executive Summary or Problem Statement.
+    
+    User Request: {query}
+    """
+    
+    messages_refine = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=refine_prompt)]
+    
+    # Stream the final refined output to Chainlit
+    async for chunk in stream_llm(messages_refine):
         yield chunk
 
 async def web_worker_stream(state: AgentState):
@@ -233,14 +259,14 @@ You are doing market research for a Principal Technical PM. Answer this question
 Here is the raw research data:
 {context}
 
-Now produce a COMPREHENSIVE research brief with:
-1. **Summary**
-2. **Key Findings**
-3. **Implications for PM**
+Produce a COMPREHENSIVE research brief:
+1. **Executive Summary**
+2. **Key Findings** (with specific data points)
+3. **Implications for PM** (what this means for strategy/roadmap)
 4. **Competitive Landscape**
 5. **Open Questions**
 
-Cite specific sources where relevant. Be substantive, not generic."""
+Cite specific sources where relevant. Be substantive."""
         
         async for chunk in stream_llm([HumanMessage(content=prompt)]):
             yield chunk
@@ -253,11 +279,9 @@ Cite specific sources where relevant. Be substantive, not generic."""
 
 async def doc_worker_stream(state: AgentState):
     query = state["messages"][-1].content
-    # CHANGED: Pull the session_id from the state
     session_id = state.get("session_id", "default")
     
     try:
-        # CHANGED: Look up the collection for this specific session
         collection = chroma_client.get_collection(name=f"docs_{state['user_id']}_{session_id}")
         results = collection.query(
             query_embeddings=embedding_model.encode([query]).tolist(),
@@ -268,7 +292,7 @@ async def doc_worker_stream(state: AgentState):
 
         prompt = f"""{PM_SYSTEM_PROMPT}
 
-You are reviewing uploaded documents on behalf of a Technical PM. Use ONLY the content inside the <document> tags below to answer. Do not invent or hallucinate.
+You are reviewing uploaded documents. Use ONLY the content inside the <document> tags.
 <document>
 {safe_context}
 </document>
@@ -277,9 +301,9 @@ Question: {query}
 
 Produce a COMPREHENSIVE answer:
 1. **Direct Answer**
-2. **Evidence from Document**
+2. **Evidence from Document** (quote specific sections)
 3. **Gaps & Ambiguities**
-4. **Implications**
+4. **Implications for PM**
 5. **Recommended Next Steps**"""
         
         async for chunk in stream_llm([HumanMessage(content=prompt)]):
@@ -322,7 +346,6 @@ workflow.add_edge("blocked", END)
 
 multi_agent_app = workflow.compile()
 
-# CHANGED: Added session_id parameter
 async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="default"):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
         yield ("answer", "Invalid user identity.")
@@ -343,7 +366,6 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
             
     history_messages.append(HumanMessage(content=user_message[:100_000]))
 
-    # CHANGED: Pass session_id into the graph state
     inputs = {"messages": history_messages, "user_id": user_id, "session_id": session_id}
     
     decision = "writer"
@@ -372,6 +394,6 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
         async for chunk in doc_worker_stream(state):
             yield ("chunk", chunk)
     else:
-        yield ("step", "✍️ **Writer Worker**...")
+        yield ("step", "✍️ **Writer Worker (Drafting & Refining)**...")
         async for chunk in writer_worker_stream(state):
             yield ("chunk", chunk)
