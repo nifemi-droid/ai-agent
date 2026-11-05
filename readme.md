@@ -9,7 +9,7 @@ Nexus acts as a specialized PM co-pilot. It routes requests between market resea
 This is not a simple wrapper around an LLM. It is a multi-agent system orchestrated with **LangGraph**.
 
 ```text
-User (NiceGUI) 
+User (Chainlit)
       │
       ▼
 [ Guardrail ] ──(unsafe)──► [ Blocked ]

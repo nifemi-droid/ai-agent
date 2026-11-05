@@ -9,5 +9,4 @@ __pycache__/
 *.sqlite3
 chroma_db/
 tenant_data/
-.nicegui/
 output_plot.png

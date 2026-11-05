@@ -181,37 +181,34 @@ INDUSTRY STANDARD REQUIREMENTS:
 5. Be concise but substantive. No filler words. Every sentence must add value.
 """
 
-# --- PROMPT CHAINING (THE SECRET SAUCE) ---
+# --- THE 3-STEP PROMPT CHAIN (Draft -> Critique -> Refine) ---
 async def writer_worker_stream(state: AgentState):
     history = state["messages"][-5:]
     query = history[-1].content.lower()
     
-    # Step 1: Determine the framework/artifact type
-    if "prd" in query or "product requirement" in query:
+    # 1. Determine Framework (Slash Commands + Intent)
+    if query.startswith("/prd") or "prd" in query or "product requirement" in query:
         artifact_type = "PRD"
-        framework = "Problem, Goals, Non-Goals, Personas, User Stories (INVEST), Functional Requirements, Non-Functional Requirements, Success Metrics (SMART), Risks, Rollout Plan"
-    elif "frd" in query or "functional requirement" in query:
+        framework = "Problem, Goals, Non-Goals, Personas, User Stories (INVEST), Functional Requirements, Success Metrics (SMART), Risks, Rollout Plan"
+    elif query.startswith("/frd") or "frd" in query:
         artifact_type = "FRD"
-        framework = "Functional Overview, User Flow, Data Contracts, State Transitions, Edge Cases, Acceptance Criteria"
-    elif any(k in query for k in ["ai", "ml", "model", "llm", "rag"]):
+        framework = "Functional Overview, User Flow, Data Contracts, Edge Cases, Acceptance Criteria"
+    elif query.startswith("/ai") or any(k in query for k in ["ai", "ml", "model", "llm", "rag"]):
         artifact_type = "AI/ML Spec"
-        framework = "Problem, Model Choice, Data Dependencies, Evaluation Plan (Hallucination, Latency, Cost), Guardrails, Observability, Rollout Strategy"
-    elif any(k in query for k in ["platform", "api", "system"]):
+        framework = "Problem, Model Choice, Data Dependencies, Evaluation Plan, Guardrails, Observability, Rollout"
+    elif query.startswith("/platform") or any(k in query for k in ["platform", "api", "system"]):
         artifact_type = "Platform Spec"
-        framework = "Problem, Build vs Buy, API Contracts, SLOs/SLAs, Scalability, DX, Migration"
+        framework = "Problem, Build vs Buy, API Contracts, SLOs/SLAs, Scalability, DX"
     else:
-        artifact_type = "Product Strategy"
-        framework = "Situation Analysis, Market Context, Options, Recommendation, Roadmap, Risks"
+        artifact_type = "Strategy Doc"
+        framework = "Situation Analysis, Market Context, Options, Recommendation, Roadmap"
 
-    # --- STEP 1: DRAFT (Think First) ---
+    # --- STEP 1: DRAFT ---
     draft_prompt = f"""
-    You are drafting the core sections of a {artifact_type}.
-    Framework to follow: {framework}.
-    
+    Draft the core sections of a {artifact_type}. 
+    Framework: {framework}.
     User Request: {query}
-    
-    Think step-by-step. Outline the key points for each section. Do not write the full document yet. 
-    Provide a structured outline with bullet points for the key arguments.
+    Provide a structured outline with bullet points. Do not write the full document yet.
     """
     
     messages_draft = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=draft_prompt)]
@@ -219,18 +216,37 @@ async def writer_worker_stream(state: AgentState):
     async for chunk in stream_llm(messages_draft):
         draft_text += chunk
 
-    # --- STEP 2: REFINE & FINALIZE (The Industry Standard Output) ---
-    refine_prompt = f"""
-    You are finalizing a {artifact_type} based on the outline below.
+    # --- STEP 2: CRITIQUE (The Secret Sauce) ---
+    critique_prompt = f"""
+    You are a VP of Product reviewing a draft {artifact_type} written by a junior PM.
     
-    Outline:
+    Draft:
     {draft_text}
     
+    Critique the draft. What is missing? Are the metrics SMART? Is the rollout realistic? 
+    Provide a bulleted list of specific improvements needed.
+    """
+    
+    messages_critique = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=critique_prompt)]
+    critique_text = ""
+    async for chunk in stream_llm(messages_critique):
+        critique_text += chunk
+
+    # --- STEP 3: REFINE & STREAM ---
+    refine_prompt = f"""
+    You are finalizing a {artifact_type}.
+    
+    Original Draft:
+    {draft_text}
+    
+    Critique from VP:
+    {critique_text}
+    
     Instructions:
-    1. Expand the outline into a full, comprehensive Markdown document.
-    2. Ensure every section from the framework is present: {framework}.
-    3. Use professional PM language. Be specific. Include tables where appropriate (e.g., Requirements, Metrics).
-    4. Do not use filler. Start directly with the Executive Summary or Problem Statement.
+    1. Address every point in the critique.
+    2. Expand the outline into a full, comprehensive Markdown document.
+    3. Ensure every section from the framework is present: {framework}.
+    4. Use tables for metrics and requirements.
     
     User Request: {query}
     """
@@ -283,9 +299,10 @@ async def doc_worker_stream(state: AgentState):
     
     try:
         collection = chroma_client.get_collection(name=f"docs_{state['user_id']}_{session_id}")
+        # Retrieve MORE chunks to support multi-document synthesis
         results = collection.query(
             query_embeddings=embedding_model.encode([query]).tolist(),
-            n_results=6
+            n_results=10 
         )
         context = "\n\n".join(results['documents'][0])
         safe_context = sanitize_context(context)
@@ -394,6 +411,7 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
         async for chunk in doc_worker_stream(state):
             yield ("chunk", chunk)
     else:
-        yield ("step", "✍️ **Writer Worker (Drafting & Refining)**...")
+        # The Writer Worker now handles the multi-step chain internally
+        yield ("step", "✍️ **Writer Worker (Drafting → Critiquing → Refining)**...")
         async for chunk in writer_worker_stream(state):
             yield ("chunk", chunk)
