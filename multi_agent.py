@@ -183,12 +183,10 @@ INDUSTRY STANDARD REQUIREMENTS:
 5. Be concise but substantive. No filler words. Every sentence must add value.
 """
 
-# --- THE 4-STEP PROMPT CHAIN (Pre-flight -> Draft -> Critique -> Refine) ---
 async def writer_worker_stream(state: AgentState):
     history = state["messages"][-5:]
     query = history[-1].content.lower()
     
-    # 1. Determine Framework (Slash Commands + Intent)
     if query.startswith("/prd") or "prd" in query or "product requirement" in query:
         artifact_type = "PRD"
         framework = "Problem, Goals, Non-Goals, Personas, User Stories (INVEST), Functional Requirements, Success Metrics (SMART), Risks, Rollout Plan"
@@ -205,14 +203,23 @@ async def writer_worker_stream(state: AgentState):
         artifact_type = "Strategy Doc"
         framework = "Situation Analysis, Market Context, Options, Recommendation, Roadmap"
 
-    # --- STEP 1: PRE-FLIGHT CHECK ---
+    # --- STEP 1: PRE-FLIGHT CHECK (Stricter) ---
     preflight_prompt = f"""
-    You are a Principal PM. The user wants a {artifact_type}.
+    You are a Principal PM reviewing a request for a {artifact_type}.
+    
     User Request: {query}
     
-    Before drafting, analyze the request. Do you have enough information (target user, constraints, success criteria) to write a strong document?
-    If YES: Reply with exactly the word "PROCEED".
-    If NO: Reply with a short, bulleted list of 2-3 specific clarifying questions you need to ask the user.
+    Evaluate: Does this request contain enough information to write a GOOD draft?
+    You should say PROCEED if:
+    - The user has stated a clear goal or feature.
+    - You can make reasonable assumptions for any missing details (e.g., assume 'iOS and Android' for mobile features).
+    
+    You should ask for clarification ONLY if:
+    - The feature is completely undefined (e.g., "Write a PRD for a new thing").
+    - A core constraint is missing (e.g., "Write a spec for a system" with no context on what it does).
+    
+    If you can proceed: Reply with exactly the word "PROCEED".
+    If you cannot: Reply with a short, bulleted list of 1-2 specific clarifying questions.
     """
     
     messages_preflight = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=preflight_prompt)]
@@ -221,9 +228,8 @@ async def writer_worker_stream(state: AgentState):
         preflight_text += chunk
         
     if "PROCEED" not in preflight_text.upper():
-        # The PM needs more info. Send the questions and stop the writer.
         yield f"**Pre-flight Check:** Before I write this {artifact_type}, I need a few details:\n\n{preflight_text}"
-        return # Exit the function early
+        return
 
     # --- STEP 2: DRAFT ---
     draft_prompt = f"""
@@ -232,7 +238,6 @@ async def writer_worker_stream(state: AgentState):
     User Request: {query}
     Provide a structured outline with bullet points. Do not write the full document yet.
     """
-    
     messages_draft = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=draft_prompt)]
     draft_text = ""
     async for chunk in stream_llm(messages_draft):
@@ -241,14 +246,11 @@ async def writer_worker_stream(state: AgentState):
     # --- STEP 3: CRITIQUE ---
     critique_prompt = f"""
     You are a VP of Product reviewing a draft {artifact_type} written by a junior PM.
-    
     Draft:
     {draft_text}
-    
     Critique the draft. What is missing? Are the metrics SMART? Is the rollout realistic? 
     Provide a bulleted list of specific improvements needed.
     """
-    
     messages_critique = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=critique_prompt)]
     critique_text = ""
     async for chunk in stream_llm(messages_critique):
@@ -257,25 +259,19 @@ async def writer_worker_stream(state: AgentState):
     # --- STEP 4: REFINE & STREAM ---
     refine_prompt = f"""
     You are finalizing a {artifact_type}.
-    
     Original Draft:
     {draft_text}
-    
     Critique from VP:
     {critique_text}
-    
     Instructions:
     1. Address every point in the critique.
     2. Expand the outline into a full, comprehensive Markdown document.
     3. Ensure every section from the framework is present: {framework}.
     4. Use tables for metrics and requirements.
-    
     User Request: {query}
     """
-    
     messages_refine = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=refine_prompt)]
     
-    # Stream the final refined output to Chainlit
     async for chunk in stream_llm(messages_refine):
         yield chunk
 
@@ -304,19 +300,16 @@ async def web_worker_stream(state: AgentState):
             
             if "YES" in decision:
                 prompt = f"""{PM_SYSTEM_PROMPT}
-
-You are doing market research for a Principal Technical PM. Answer this question with comprehensive depth:
-{query}
-
-Here is the raw research data:
-{context}
-
-Produce a COMPREHENSIVE research brief:
-1. **Executive Summary**
-2. **Key Findings** (with specific data points)
-3. **Implications for PM**
-4. **Competitive Landscape**
-5. **Open Questions**"""
+                You are doing market research for a Principal Technical PM. Answer this question with comprehensive depth:
+                {query}
+                Here is the raw research data:
+                {context}
+                Produce a COMPREHENSIVE research brief:
+                1. **Executive Summary**
+                2. **Key Findings** (with specific data points)
+                3. **Implications for PM**
+                4. **Competitive Landscape**
+                5. **Open Questions**"""
                 
                 async for chunk in stream_llm([HumanMessage(content=prompt)]):
                     yield chunk
