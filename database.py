@@ -5,6 +5,7 @@ import hashlib
 import datetime
 import secrets
 import base64
+import numpy as np
 
 DB_NAME = "chat_history.db"
 SALES_DB = "sales.db"
@@ -27,7 +28,6 @@ def verify_password(password, stored_hash):
         actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
         return secrets.compare_digest(actual, expected)
     except (ValueError, TypeError):
-        # Fallback for legacy SHA256 hashes
         return secrets.compare_digest(hashlib.sha256(password.encode("utf-8")).hexdigest(), stored_hash)
 
 def ensure_dbs_exist():
@@ -45,13 +45,11 @@ def ensure_dbs_exist():
         )
     """)
     
-    # --- MIGRATION: Add timestamp column if missing ---
     cursor.execute("PRAGMA table_info(users)")
     columns = [col[1] for col in cursor.fetchall()]
     if "timestamp" not in columns:
         cursor.execute("ALTER TABLE users ADD COLUMN timestamp DATETIME")
         cursor.execute("UPDATE users SET timestamp = ? WHERE timestamp IS NULL", (datetime.datetime.now(),))
-    # --------------------------------------------------
     
     # 2. Sessions Table
     cursor.execute("""
@@ -96,7 +94,17 @@ def ensure_dbs_exist():
         )
     """)
     
-    # 6. Single-User Seed: Ensure 'local' admin exists
+    # 6. Semantic Cache Table (NEW)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS semantic_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prompt_embedding BLOB,
+            response TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # 7. Single-User Seed
     cursor.execute("SELECT 1 FROM users WHERE id = 'local'")
     if not cursor.fetchone():
         cursor.execute(
@@ -107,7 +115,7 @@ def ensure_dbs_exist():
     conn.commit()
     conn.close()
 
-    # 7. Ensure sales DB exists (legacy fallback)
+    # 8. Ensure sales DB exists
     if not os.path.exists(SALES_DB):
         conn = sqlite3.connect(SALES_DB)
         cursor = conn.cursor()
@@ -133,6 +141,7 @@ def ensure_dbs_exist():
         conn.commit()
         conn.close()
 
+# --- AUTHENTICATION ---
 def create_user(email, password):
     email = email.strip().lower()
     if len(email) > 254 or "@" not in email or len(password) < 12:
@@ -162,13 +171,13 @@ def authenticate_user(email, password):
     if not row or not verify_password(password, row[1]):
         conn.close()
         return None
-    # Migrate legacy SHA256 hashes to PBKDF2 on successful login
     if not row[1].startswith("pbkdf2_sha256$"):
         cursor.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(password), row[0]))
         conn.commit()
     conn.close()
     return row[0]
 
+# --- SESSIONS ---
 def create_session(user_id, title="New Chat"):
     session_id = str(uuid.uuid4())
     conn = sqlite3.connect(DB_NAME)
@@ -187,7 +196,6 @@ def get_sessions(user_id):
     return rows
 
 def delete_session(session_id, user_id):
-    """IDOR FIX: Verify the session belongs to the user before deleting."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM sessions WHERE id = ?", (session_id,))
@@ -201,6 +209,7 @@ def delete_session(session_id, user_id):
     conn.close()
     return True
 
+# --- MESSAGES ---
 def save_message(session_id, role, content, user_id=None):
     if role not in ("user", "assistant") or len(content) > 100_000:
         return False
@@ -222,7 +231,6 @@ def save_message(session_id, role, content, user_id=None):
     return True
 
 def load_messages(session_id, user_id):
-    """IDOR FIX: Only load messages if the session belongs to the user."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
@@ -237,7 +245,6 @@ def load_messages(session_id, user_id):
     return [{"role": row[0], "content": row[1]} for row in rows]
 
 def delete_last_message(session_id, user_id):
-    """IDOR FIX: Only delete if the session belongs to the user."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM sessions WHERE id = ?", (session_id,))
@@ -253,6 +260,7 @@ def delete_last_message(session_id, user_id):
     conn.close()
     return True
 
+# --- ANALYTICS ---
 def log_analytics(user_query, tool_used, latency):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -276,6 +284,7 @@ def get_analytics_by_route():
     conn.close()
     return dict(rows)
 
+# --- PROFILE HELPERS ---
 def get_user_email(user_id):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -319,7 +328,6 @@ def get_all_sessions_for_user(user_id):
     return rows
 
 def get_user_joined_date(user_id):
-    """Returns the account creation date as YYYY-MM-DD, or 'N/A' if missing."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     try:
@@ -333,6 +341,7 @@ def get_user_joined_date(user_id):
         return str(row[0])[:10]
     return "N/A"
 
+# --- RATE LIMITING ---
 def check_rate_limit(user_id, max_tokens=10, refill_seconds=60):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -375,3 +384,42 @@ def get_rate_limit_status(user_id, max_tokens=10, refill_seconds=60):
         return max_tokens
     conn.close()
     return max(tokens, 0)
+
+# --- SEMANTIC CACHE HELPERS (NEW) ---
+def get_cached_response(embedding_list):
+    """Returns a cached response if a similar prompt exists (>0.95 similarity)."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT prompt_embedding, response FROM semantic_cache ORDER BY timestamp DESC LIMIT 100")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if not rows:
+        return None
+        
+    query_emb = np.array(embedding_list[0])
+    
+    for emb_blob, response in rows:
+        # Convert BLOB back to numpy array
+        cached_emb = np.frombuffer(emb_blob, dtype=np.float32)
+        
+        # Cosine similarity
+        similarity = np.dot(query_emb, cached_emb) / (np.linalg.norm(query_emb) * np.linalg.norm(cached_emb))
+        
+        if similarity > 0.95:
+            print(f"⚡ Cache Hit! Similarity: {similarity:.3f}")
+            return response
+            
+    return None
+
+def save_to_cache(embedding_list, response):
+    """Saves a new prompt and response to the cache."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    emb_blob = np.array(embedding_list[0], dtype=np.float32).tobytes()
+    cursor.execute(
+        "INSERT INTO semantic_cache (prompt_embedding, response) VALUES (?, ?)",
+        (emb_blob, response)
+    )
+    conn.commit()
+    conn.close()
