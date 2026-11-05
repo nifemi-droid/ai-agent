@@ -1,10 +1,8 @@
 import asyncio
 import time
+import uuid
 from multi_agent import ask_agent_v2_stream
 
-# THE GOLDEN DATASET
-# These prompts are specific enough to bypass the "Pre-flight Check" 
-# and force the bot to generate the full document.
 GOLDEN_TESTS = [
     {
         "name": "PRD Generation",
@@ -39,21 +37,30 @@ async def run_eval():
     
     for test in GOLDEN_TESTS:
         print(f"--- Testing: {test['name']} ---")
-        print(f"Prompt: {test['prompt']}")
+        
+        # Force a unique session ID and history to bypass the Semantic Cache
+        unique_session = str(uuid.uuid4())
         
         start_time = time.time()
         full_response = ""
         
         try:
-            # We pass a unique session ID for each test to avoid cross-contamination
             async for kind, content in ask_agent_v2_stream(
-                test['prompt'], "eval_user", [], f"eval_session_{test['name']}"
+                test['prompt'], "eval_user", [], unique_session
             ):
                 if kind == "chunk":
+                    full_response += content
+                elif kind == "answer":
                     full_response += content
                     
             latency = time.time() - start_time
             
+            if len(full_response) < 50:
+                print(f"⚠️ Warning: Agent returned almost nothing ({len(full_response)} chars).")
+                print(f"Raw output: {full_response[:200]}")
+                print("❌ FAIL\n")
+                continue
+                
             # 1. Check Latency
             latency_pass = latency <= test['max_latency']
             print(f"⏱️ Latency: {latency:.2f}s (Max: {test['max_latency']}s) -> {'✅' if latency_pass else '❌'}")
@@ -78,7 +85,7 @@ async def run_eval():
                 print("❌ FAIL\n")
                 
         except Exception as e:
-            print(f"❌ CRASHED: {e}\n")
+            print(f"❌ CRASHED: {type(e).__name__}: {e}\n")
             
     print(f"=====================================")
     print(f"FINAL SCORE: {passed}/{total} tests passed.")
