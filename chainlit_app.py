@@ -11,22 +11,53 @@ async def on_chat_start():
     cl.user_session.set("verbose_mode", False)
     cl.user_session.set("show_sources", True)
     
-    # Send a welcome message with a Settings button
+    # --- PM TOOLBOX (Quick Actions) ---
     actions = [
+        cl.Action(name="tool_prd", value="prd", label="📝 Write a PRD", payload={}),
+        cl.Action(name="tool_frd", value="frd", label="📊 Create an FRD", payload={}),
+        cl.Action(name="tool_ai", value="ai", label="🤖 Design an AI Spec", payload={}),
+        cl.Action(name="tool_platform", value="platform", label="⚙️ Platform Spec", payload={}),
         cl.Action(name="open_settings", value="open", label="⚙️ Settings", payload={})
     ]
     
     await cl.Message(
         content="✦ **Nexus** — Your Technical PM Co-pilot.\n\n"
-                "Ask me to write a PRD, research a market, or analyze a document. "
-                "Use the attach button below to upload a PDF, DOCX, or CSV.",
+                "Select a tool below to start, or just type your question.",
         actions=actions
     ).send()
 
 
+@cl.on_chat_resume
+async def on_chat_resume(thread):
+    """Called when a user clicks an old chat in the sidebar."""
+    cl.user_session.set("history", [])
+    cl.user_session.set("verbose_mode", False)
+    cl.user_session.set("show_sources", True)
+    
+    await cl.Message(content="Resumed session. Note: The bot's memory of the previous context has been reset.").send()
+
+
+# --- TOOLBOX CALLBACKS ---
+@cl.action_callback("tool_prd")
+async def on_tool_prd(action: cl.Action):
+    await cl.Message(content="📝 **PRD Mode Activated**\n\nPlease describe the feature or product you want me to write a PRD for. (e.g., 'A notification system for mobile users')").send()
+
+@cl.action_callback("tool_frd")
+async def on_tool_frd(action: cl.Action):
+    await cl.Message(content="📊 **FRD Mode Activated**\n\nPlease describe the feature you want me to write an FRD for.").send()
+
+@cl.action_callback("tool_ai")
+async def on_tool_ai(action: cl.Action):
+    await cl.Message(content="🤖 **AI Spec Mode Activated**\n\nPlease describe the AI/ML product you want to spec out. I will include evaluation metrics, guardrails, and cost modeling.").send()
+
+@cl.action_callback("tool_platform")
+async def on_tool_platform(action: cl.Action):
+    await cl.Message(content="⚙️ **Platform Spec Mode Activated**\n\nPlease describe the internal platform or API you want to spec out. I will include SLOs, API contracts, and Build vs Buy analysis.").send()
+
+
+# --- SETTINGS CALLBACKS ---
 @cl.action_callback("open_settings")
 async def on_settings_action(action: cl.Action):
-    """Renders the current settings and toggle buttons."""
     verbose = cl.user_session.get("verbose_mode", False)
     sources = cl.user_session.get("show_sources", True)
     
@@ -41,13 +72,11 @@ async def on_settings_action(action: cl.Action):
         ]
     ).send()
 
-
 @cl.action_callback("toggle_verbose")
 async def on_toggle_verbose(action: cl.Action):
     current = cl.user_session.get("verbose_mode", False)
     cl.user_session.set("verbose_mode", not current)
     await cl.Message(content=f"Agent Routing is now **{'ON' if not current else 'OFF'}**.").send()
-
 
 @cl.action_callback("toggle_sources")
 async def on_toggle_sources(action: cl.Action):
@@ -56,13 +85,12 @@ async def on_toggle_sources(action: cl.Action):
     await cl.Message(content=f"Show Sources is now **{'ON' if not current else 'OFF'}**.").send()
 
 
+# --- MAIN MESSAGE HANDLER ---
 @cl.on_message
 async def on_message(message: cl.Message):
     """Called every time the user sends a message."""
     
     user_id = "local"
-    # Chainlit gives each chat session a unique ID. 
-    # Clicking "New Chat" isolates the documents via this ID.
     session_id = cl.context.session.id
     history = cl.user_session.get("history") or []
     
@@ -87,13 +115,11 @@ async def on_message(message: cl.Message):
             msg = cl.Message(content=f"📁 Processing {len(files_to_ingest)} file(s)...")
             await msg.send()
             
-            # Call existing ingest_files with the session-scoped ID
             res = await cl.make_async(ingest_files)(files_to_ingest, user_id, session_id)
             
             msg.content = res
             await msg.update()
             
-            # If the user only uploaded a file without a text prompt, stop here
             if not message.content or message.content.strip() == "":
                 return
 
@@ -112,7 +138,6 @@ async def on_message(message: cl.Message):
             message.content, user_id, history, session_id
         ):
             if kind == "step":
-                # If verbose mode is on, show the step. Otherwise, log to terminal silently.
                 if verbose_mode:
                     await cl.Message(content=f"_{content}_").send()
                 else:
@@ -148,11 +173,3 @@ async def on_message(message: cl.Message):
     history.append({"role": "user", "content": message.content})
     history.append({"role": "assistant", "content": final_answer.content})
     cl.user_session.set("history", history)
-
-
-@cl.on_chat_resume
-async def on_chat_resume(thread):
-    """Called when a user resumes an old chat from the sidebar."""
-    cl.user_session.set("history", [])
-    cl.user_session.set("verbose_mode", False)
-    cl.user_session.set("show_sources", True)

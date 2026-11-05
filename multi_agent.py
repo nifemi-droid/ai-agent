@@ -16,7 +16,6 @@ from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 import chromadb
 
-# Import cache functions from database
 from database import get_cached_response, save_to_cache
 
 load_dotenv()
@@ -184,10 +183,12 @@ INDUSTRY STANDARD REQUIREMENTS:
 5. Be concise but substantive. No filler words. Every sentence must add value.
 """
 
+# --- THE 4-STEP PROMPT CHAIN (Pre-flight -> Draft -> Critique -> Refine) ---
 async def writer_worker_stream(state: AgentState):
     history = state["messages"][-5:]
     query = history[-1].content.lower()
     
+    # 1. Determine Framework (Slash Commands + Intent)
     if query.startswith("/prd") or "prd" in query or "product requirement" in query:
         artifact_type = "PRD"
         framework = "Problem, Goals, Non-Goals, Personas, User Stories (INVEST), Functional Requirements, Success Metrics (SMART), Risks, Rollout Plan"
@@ -204,44 +205,77 @@ async def writer_worker_stream(state: AgentState):
         artifact_type = "Strategy Doc"
         framework = "Situation Analysis, Market Context, Options, Recommendation, Roadmap"
 
+    # --- STEP 1: PRE-FLIGHT CHECK ---
+    preflight_prompt = f"""
+    You are a Principal PM. The user wants a {artifact_type}.
+    User Request: {query}
+    
+    Before drafting, analyze the request. Do you have enough information (target user, constraints, success criteria) to write a strong document?
+    If YES: Reply with exactly the word "PROCEED".
+    If NO: Reply with a short, bulleted list of 2-3 specific clarifying questions you need to ask the user.
+    """
+    
+    messages_preflight = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=preflight_prompt)]
+    preflight_text = ""
+    async for chunk in stream_llm(messages_preflight):
+        preflight_text += chunk
+        
+    if "PROCEED" not in preflight_text.upper():
+        # The PM needs more info. Send the questions and stop the writer.
+        yield f"**Pre-flight Check:** Before I write this {artifact_type}, I need a few details:\n\n{preflight_text}"
+        return # Exit the function early
+
+    # --- STEP 2: DRAFT ---
     draft_prompt = f"""
     Draft the core sections of a {artifact_type}. 
     Framework: {framework}.
     User Request: {query}
     Provide a structured outline with bullet points. Do not write the full document yet.
     """
+    
     messages_draft = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=draft_prompt)]
     draft_text = ""
     async for chunk in stream_llm(messages_draft):
         draft_text += chunk
 
+    # --- STEP 3: CRITIQUE ---
     critique_prompt = f"""
     You are a VP of Product reviewing a draft {artifact_type} written by a junior PM.
+    
     Draft:
     {draft_text}
+    
     Critique the draft. What is missing? Are the metrics SMART? Is the rollout realistic? 
     Provide a bulleted list of specific improvements needed.
     """
+    
     messages_critique = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=critique_prompt)]
     critique_text = ""
     async for chunk in stream_llm(messages_critique):
         critique_text += chunk
 
+    # --- STEP 4: REFINE & STREAM ---
     refine_prompt = f"""
     You are finalizing a {artifact_type}.
+    
     Original Draft:
     {draft_text}
+    
     Critique from VP:
     {critique_text}
+    
     Instructions:
     1. Address every point in the critique.
     2. Expand the outline into a full, comprehensive Markdown document.
     3. Ensure every section from the framework is present: {framework}.
     4. Use tables for metrics and requirements.
+    
     User Request: {query}
     """
+    
     messages_refine = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=refine_prompt)]
     
+    # Stream the final refined output to Chainlit
     async for chunk in stream_llm(messages_refine):
         yield chunk
 
@@ -251,7 +285,6 @@ async def web_worker_stream(state: AgentState):
     
     for attempt in range(max_retries):
         try:
-            # Attempt the search
             res = tavily.search(query=query, search_depth="advanced", timeout=15)
             context = "\n\n".join([
                 f"SOURCE: {r['title']}\nURL: {r['url']}\nCONTENT: {r['content']}"
@@ -261,10 +294,8 @@ async def web_worker_stream(state: AgentState):
             
             eval_prompt = f"""
             You are a research assistant. The user asked: "{query}"
-            
             Here are the search results:
             {context}
-            
             Do these results contain enough specific information to answer the user's question comprehensively?
             Reply with exactly one word: 'YES' or 'NO'.
             """
@@ -325,21 +356,18 @@ async def doc_worker_stream(state: AgentState):
     try:
         collection = chroma_client.get_collection(name=f"docs_{state['user_id']}_{session_id}")
         
-        # 1. Dense Retrieval (Vector)
         dense_results = collection.query(
             query_embeddings=embedding_model.encode([query]).tolist(),
             n_results=10
         )
         dense_chunks = dense_results['documents'][0]
         
-        # 2. Sparse Retrieval (BM25)
         all_docs = collection.get()['documents']
         tokenized_docs = [doc.lower().split() for doc in all_docs]
         bm25 = BM25Okapi(tokenized_docs)
         tokenized_query = query.lower().split()
         sparse_chunks = bm25.get_top_n(tokenized_query, all_docs, n=10)
         
-        # 3. Reciprocal Rank Fusion (Merge)
         scores = {}
         for rank, chunk in enumerate(dense_chunks):
             scores[chunk] = scores.get(chunk, 0) + (1 / (60 + rank + 1))
@@ -463,7 +491,7 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
             full_response += chunk
             yield ("chunk", chunk)
     else:
-        yield ("step", "✍️ **Writer Worker (Drafting → Critiquing → Refining)**...")
+        yield ("step", "✍️ **Writer Worker (Pre-flight → Drafting → Critiquing → Refining)**...")
         async for chunk in writer_worker_stream(state):
             full_response += chunk
             yield ("chunk", chunk)
