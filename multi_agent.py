@@ -251,6 +251,7 @@ async def web_worker_stream(state: AgentState):
     
     for attempt in range(max_retries):
         try:
+            # Attempt the search
             res = tavily.search(query=query, search_depth="advanced", timeout=15)
             context = "\n\n".join([
                 f"SOURCE: {r['title']}\nURL: {r['url']}\nCONTENT: {r['content']}"
@@ -260,8 +261,10 @@ async def web_worker_stream(state: AgentState):
             
             eval_prompt = f"""
             You are a research assistant. The user asked: "{query}"
+            
             Here are the search results:
             {context}
+            
             Do these results contain enough specific information to answer the user's question comprehensively?
             Reply with exactly one word: 'YES' or 'NO'.
             """
@@ -270,16 +273,19 @@ async def web_worker_stream(state: AgentState):
             
             if "YES" in decision:
                 prompt = f"""{PM_SYSTEM_PROMPT}
-                You are doing market research for a Principal Technical PM. Answer this question with comprehensive depth:
-                {query}
-                Here is the raw research data:
-                {context}
-                Produce a COMPREHENSIVE research brief:
-                1. **Executive Summary**
-                2. **Key Findings** (with specific data points)
-                3. **Implications for PM**
-                4. **Competitive Landscape**
-                5. **Open Questions**"""
+
+You are doing market research for a Principal Technical PM. Answer this question with comprehensive depth:
+{query}
+
+Here is the raw research data:
+{context}
+
+Produce a COMPREHENSIVE research brief:
+1. **Executive Summary**
+2. **Key Findings** (with specific data points)
+3. **Implications for PM**
+4. **Competitive Landscape**
+5. **Open Questions**"""
                 
                 async for chunk in stream_llm([HumanMessage(content=prompt)]):
                     yield chunk
@@ -299,12 +305,18 @@ async def web_worker_stream(state: AgentState):
                     query = refine_response.content.strip()
                     print(f"🔄 Refining search query to: {query}")
                 else:
-                    async for chunk in stream_llm([HumanMessage(content=f"Web search failed after {max_retries} attempts.")]):
+                    yield "I could not find real-time data for this. However, based on my internal knowledge: \n\n"
+                    async for chunk in stream_llm([HumanMessage(content=f"Answer this based on your training data: {query}")]):
                         yield chunk
-                        
+                    
         except Exception as e:
-            yield f"Web search failed: {e}"
-            break
+            print(f"Network error on attempt {attempt+1}: {e}")
+            if attempt == max_retries - 1:
+                yield "⚠️ **Network connection to the web search failed.** Falling back to internal knowledge...\n\n"
+                async for chunk in stream_llm([HumanMessage(content=f"Answer this based on your training data: {query}")]):
+                    yield chunk
+            else:
+                time.sleep(2)
 
 async def doc_worker_stream(state: AgentState):
     query = state["messages"][-1].content
@@ -402,7 +414,6 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
     if history is None:
         history = []
         
-    # --- 1. CHECK CACHE ---
     if not history:
         query_emb = embedding_model.encode([user_message]).tolist()
         cached = get_cached_response(query_emb)
@@ -457,7 +468,6 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
             full_response += chunk
             yield ("chunk", chunk)
             
-    # --- 2. SAVE TO CACHE ---
     if not history and decision != "doc":
         query_emb = embedding_model.encode([user_message]).tolist()
         save_to_cache(query_emb, full_response)
