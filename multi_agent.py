@@ -171,18 +171,14 @@ async def stream_llm(messages):
         except Exception as fallback_error:
             yield f"\n\n**AI systems offline:** {fallback_error}"
 
-PM_SYSTEM_PROMPT = """You are a Principal Technical Product Manager with 10+ years of experience at top-tier tech companies (Google, Stripe, OpenAI). 
-
-You are known for producing rigorous, data-driven, and comprehensive product artifacts. You never give surface-level answers.
-
-INDUSTRY STANDARD REQUIREMENTS:
-1. Always structure your reasoning. Before writing, outline the logical flow.
-2. Use frameworks: RICE for prioritization, INVEST for user stories, SMART for goals.
-3. For AI/ML products, always include: model choice rationale, eval metrics, guardrails, and cost modeling.
-4. For Platform products, always include: API contracts, SLOs/SLAs, and Build vs. Buy analysis.
-5. Be concise but substantive. No filler words. Every sentence must add value.
+PM_SYSTEM_PROMPT = """You are a Principal Technical Product Manager with 10+ years of experience at top-tier tech companies. 
+You produce rigorous, data-driven, and comprehensive product artifacts. You never give surface-level answers.
+Use frameworks: RICE for prioritization, INVEST for user stories, SMART for goals.
+For AI/ML products, always include: model choice rationale, eval metrics, guardrails, and cost modeling.
+For Platform products, always include: API contracts, SLOs/SLAs, and Build vs. Buy analysis.
 """
 
+# --- OPTIMIZED 3-STEP CHAIN (Manager -> Writer -> Refine) ---
 async def writer_worker_stream(state: AgentState):
     history = state["messages"][-5:]
     query = history[-1].content.lower()
@@ -203,39 +199,12 @@ async def writer_worker_stream(state: AgentState):
         artifact_type = "Strategy Doc"
         framework = "Situation Analysis, Market Context, Options, Recommendation, Roadmap"
 
-    # --- STEP 1: PRE-FLIGHT CHECK (Stricter) ---
-    preflight_prompt = f"""
-    You are a Principal PM reviewing a request for a {artifact_type}.
-    
-    User Request: {query}
-    
-    Evaluate: Does this request contain enough information to write a GOOD draft?
-    You should say PROCEED if:
-    - The user has stated a clear goal or feature.
-    - You can make reasonable assumptions for any missing details (e.g., assume 'iOS and Android' for mobile features).
-    
-    You should ask for clarification ONLY if:
-    - The feature is completely undefined (e.g., "Write a PRD for a new thing").
-    - A core constraint is missing (e.g., "Write a spec for a system" with no context on what it does).
-    
-    If you can proceed: Reply with exactly the word "PROCEED".
-    If you cannot: Reply with a short, bulleted list of 1-2 specific clarifying questions.
-    """
-    
-    messages_preflight = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=preflight_prompt)]
-    preflight_text = ""
-    async for chunk in stream_llm(messages_preflight):
-        preflight_text += chunk
-        
-    if "PROCEED" not in preflight_text.upper():
-        yield f"**Pre-flight Check:** Before I write this {artifact_type}, I need a few details:\n\n{preflight_text}"
-        return
-
-    # --- STEP 2: DRAFT ---
+    # --- STEP 1: FAST DRAFT (No pre-flight check to save time) ---
     draft_prompt = f"""
-    Draft the core sections of a {artifact_type}. 
+    Draft a {artifact_type} based on the request below.
     Framework: {framework}.
     User Request: {query}
+    
     Provide a structured outline with bullet points. Do not write the full document yet.
     """
     messages_draft = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=draft_prompt)]
@@ -243,31 +212,20 @@ async def writer_worker_stream(state: AgentState):
     async for chunk in stream_llm(messages_draft):
         draft_text += chunk
 
-    # --- STEP 3: CRITIQUE ---
-    critique_prompt = f"""
-    You are a VP of Product reviewing a draft {artifact_type} written by a junior PM.
-    Draft:
-    {draft_text}
-    Critique the draft. What is missing? Are the metrics SMART? Is the rollout realistic? 
-    Provide a bulleted list of specific improvements needed.
-    """
-    messages_critique = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=critique_prompt)]
-    critique_text = ""
-    async for chunk in stream_llm(messages_critique):
-        critique_text += chunk
-
-    # --- STEP 4: REFINE & STREAM ---
+    # --- STEP 2: CRITIQUE & REFINE (Combined into one call) ---
     refine_prompt = f"""
     You are finalizing a {artifact_type}.
+    
     Original Draft:
     {draft_text}
-    Critique from VP:
-    {critique_text}
+    
     Instructions:
-    1. Address every point in the critique.
-    2. Expand the outline into a full, comprehensive Markdown document.
-    3. Ensure every section from the framework is present: {framework}.
-    4. Use tables for metrics and requirements.
+    1. Internally critique the draft: What is missing? Are the metrics SMART? Is the rollout realistic?
+    2. Address those critiques.
+    3. Expand the outline into a full, comprehensive Markdown document.
+    4. Ensure every section from the framework is present: {framework}.
+    5. Use tables for metrics and requirements.
+    
     User Request: {query}
     """
     messages_refine = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=refine_prompt)]
@@ -484,7 +442,7 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
             full_response += chunk
             yield ("chunk", chunk)
     else:
-        yield ("step", "✍️ **Writer Worker (Pre-flight → Drafting → Critiquing → Refining)**...")
+        yield ("step", "✍️ **Writer Worker (Drafting → Refining)**...")
         async for chunk in writer_worker_stream(state):
             full_response += chunk
             yield ("chunk", chunk)
