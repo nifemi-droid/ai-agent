@@ -6,19 +6,19 @@ from multi_agent import ask_agent_v2_stream
 GOLDEN_TESTS = [
     {
         "name": "PRD Generation",
-        "prompt": "Write a PRD for a mobile push notification system for an e-commerce app. Target users are returning shoppers. Success metric is a 15% increase in repeat purchases within 3 months.",
+        "prompt": "Write a comprehensive PRD for a mobile push notification system for an e-commerce app. Target users are returning shoppers. Success metric is a 15% increase in repeat purchases within 3 months. Please include all standard sections: Problem, Goals, User Stories, Success Metrics, and Risks.",
         "required_sections": ["Problem", "Goals", "User Stories", "Success Metrics", "Risks"],
         "max_latency": 25.0
     },
     {
         "name": "AI/ML Spec",
-        "prompt": "Write an AI/ML spec for a RAG-based customer support bot for a SaaS company. It needs to handle 50,000 queries a day. Target latency is <2 seconds. Budget is $0.01 per query.",
+        "prompt": "Write a comprehensive AI/ML spec for a RAG-based customer support bot for a SaaS company. It needs to handle 50,000 queries a day. Target latency is <2 seconds. Budget is $0.01 per query. Please include all standard sections: Model Choice, Evaluation Plan, Guardrails, and Cost Model.",
         "required_sections": ["Model Choice", "Evaluation Plan", "Guardrails", "Cost Model"],
         "max_latency": 30.0
     },
     {
         "name": "Platform Spec",
-        "prompt": "Write a platform spec for an internal API gateway that will serve 10 internal microservices. Target uptime is 99.99%. We need to decide whether to build it in-house or use AWS API Gateway.",
+        "prompt": "Write a comprehensive platform spec for an internal API gateway that will serve 10 internal microservices. Target uptime is 99.99%. We need to decide whether to build it in-house or use AWS API Gateway. Please include all standard sections: API Contracts, SLOs, Build vs Buy, and Scalability.",
         "required_sections": ["API Contracts", "SLOs", "Build vs Buy", "Scalability"],
         "max_latency": 30.0
     },
@@ -37,9 +37,11 @@ async def run_eval():
     
     for test in GOLDEN_TESTS:
         print(f"--- Testing: {test['name']} ---")
+        print(f"Prompt: {test['prompt'][:80]}...")
         
-        # Force a unique session ID and history to bypass the Semantic Cache
+        # Force a unique session ID to bypass the Semantic Cache
         unique_session = str(uuid.uuid4())
+        print(f"🔎 Using session: {unique_session}")
         
         start_time = time.time()
         full_response = ""
@@ -57,7 +59,7 @@ async def run_eval():
             
             if len(full_response) < 50:
                 print(f"⚠️ Warning: Agent returned almost nothing ({len(full_response)} chars).")
-                print(f"Raw output: {full_response[:200]}")
+                print(f"🔍 DEBUG — Raw output: {full_response[:500]}")
                 print("❌ FAIL\n")
                 continue
                 
@@ -76,6 +78,7 @@ async def run_eval():
                 print(f"📝 Sections: All {len(test['required_sections'])} required sections found. -> ✅")
             else:
                 print(f"📝 Sections: Missing {missing_sections} -> ❌")
+                print(f"🔍 DEBUG — First 500 chars of response:\n{full_response[:500]}\n")
                 
             # 3. Final Verdict
             if latency_pass and sections_pass:
