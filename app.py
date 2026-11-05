@@ -87,6 +87,24 @@ GLOBAL_CSS = """
         font-size: 0.85rem;
         color: #e6edf3;
     }
+    
+    /* --- ATTACH BUTTON STYLING --- */
+    .custom-attach-label {
+        display: inline-flex;
+        align-items: center;
+        cursor: pointer;
+        color: #9ca3af;
+        padding: 8px;
+        border-radius: 4px;
+        transition: background-color 0.2s, color 0.2s;
+    }
+    .custom-attach-label:hover {
+        background-color: rgba(255,255,255,0.1);
+        color: #ffffff;
+    }
+    .custom-attach-label input[type="file"] {
+        display: none;
+    }
 </style>
 """
 
@@ -296,7 +314,7 @@ def main_page(session: str = None):
 
             # Input Area
             with ui.row().classes('w-full max-w-3xl mx-auto px-4 pb-6 absolute bottom-0 left-0 right-0'):
-                with ui.card().classes('w-full bg-gray-800 rounded-2xl flex-col p-2 border border-gray-700'):
+                with ui.card().classes('w-full bg-gray-800 rounded-2xl flex-col p-2 border border-gray-700 relative'):
                     
                     async def handle_file_event(e):
                         file_name = e.args['name']
@@ -314,31 +332,30 @@ def main_page(session: str = None):
                         .props('outlined dense autogrow')\
                         .classes('w-full bg-transparent text-white pl-10')
 
-                    ui.add_body_html('''
-                        <input type="file" id="native-upload" accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" style="display: none;" />
-                        <script>
-                        document.getElementById('native-upload').addEventListener('change', function(e) {
-                            const file = e.target.files[0];
-                            if (file) {
-                                const reader = new FileReader();
-                                reader.onload = function(event) {
-                                    const base64Data = event.target.result.split(',')[1];
-                                    emitEvent('file_uploaded', {name: file.name, data: base64Data});
-                                };
-                                reader.readAsDataURL(file);
-                            }
-                            e.target.value = '';
-                        });
-                        </script>
-                    ''')
-
-                    # The NiceGUI row for the buttons
                     with ui.row().classes('w-full justify-between items-center'):
                         with ui.row().classes('gap-2 items-center'):
-                            # Native NiceGUI button that triggers the hidden input
-                            ui.button('📎', on_click=lambda: ui.run_javascript('document.getElementById("native-upload").click()'))\
-                                .props('flat dense color=grey-5 text-lg')
-
+                            # The native HTML label. The browser handles the click.
+                            ui.add_body_html('''
+                                <label class="custom-attach-label">
+                                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+                                    <input type="file" id="native-upload" accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" />
+                                </label>
+                                <script>
+                                    document.getElementById('native-upload').addEventListener('change', function(e) {
+                                        const file = e.target.files[0];
+                                        if (file) {
+                                            const reader = new FileReader();
+                                            reader.onload = function(event) {
+                                                const base64Data = event.target.result.split(',')[1];
+                                                emitEvent('file_uploaded', {name: file.name, data: base64Data});
+                                            };
+                                            reader.readAsDataURL(file);
+                                        }
+                                        e.target.value = '';
+                                    });
+                                </script>
+                            ''')
+                            
                         with ui.row().classes('gap-2'):
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
                             send_btn = ui.button('Send', on_click=lambda: send()).props('flat dense color=blue-400')
@@ -358,7 +375,6 @@ def main_page(session: str = None):
                             ui.notify('Rate limit exceeded. Wait 60s.', type='negative')
                             return
                         
-                        # Get history BEFORE saving the new message
                         history = load_messages(app.storage.user['current_session'], USER_ID)
                         
                         input_box.value = ''
@@ -393,7 +409,6 @@ def main_page(session: str = None):
                         got_answer = False
                         try:
                             current_task = asyncio.current_task()
-                            # Pass history to the agent
                             history = load_messages(app.storage.user['current_session'], USER_ID)
                             async for kind, content in ask_agent_v2_stream(prompt, USER_ID, history):
                                 if kind == "step":
