@@ -43,6 +43,7 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     next_agent: str
     user_id: str
+    session_id: str # NEW: Tracks the current chat session
 
 llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, api_key=GROQ_KEY)
 fallback_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.3, api_key=GROQ_KEY)
@@ -83,9 +84,12 @@ def _extract_text(file_bytes: bytes, file_name: str) -> str:
         return ""
     return ""
 
-def ingest_files(files, user_id):
+# CHANGED: Added session_id to scope documents per chat
+def ingest_files(files, user_id, session_id):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
         return "Upload rejected: invalid identity."
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
+        return "Upload rejected: invalid session."
     if not files or not isinstance(files, list):
         return "No files received."
     if len(files) > MAX_FILES:
@@ -120,7 +124,9 @@ def ingest_files(files, user_id):
         return "No readable text found in the uploaded files."
 
     embeddings = embedding_model.encode(all_chunks).tolist()
-    collection_name = f"docs_{user_id}"
+    
+    # CHANGED: Unique collection for this specific chat session
+    collection_name = f"docs_{user_id}_{session_id}"
     try:
         chroma_client.delete_collection(name=collection_name)
     except Exception:
@@ -189,11 +195,9 @@ CONTEXT: You are in an ongoing conversation. Use the previous messages to unders
 """
 
 async def writer_worker_stream(state: AgentState):
-    # Take the last 5 messages for context
     history = state["messages"][-5:]
     query = history[-1].content.lower()
     
-    # Slash command handling
     if query.startswith("/prd"):
         template = "Produce a COMPREHENSIVE **PRD**. Every section must be filled with substantive content.\n\n1. **Executive Summary**\n2. **Problem Statement**\n3. **Goals & Non-Goals**\n4. **Personas & Jobs-to-be-Done**\n5. **User Stories**\n6. **Functional Requirements**\n7. **Non-Functional Requirements**\n8. **Success Metrics**\n9. **Risks & Mitigations**\n10. **Open Questions**\n11. **Rollout Plan**\n12. **Dependencies & Constraints**"
     elif query.startswith("/frd"):
@@ -249,8 +253,12 @@ Cite specific sources where relevant. Be substantive, not generic."""
 
 async def doc_worker_stream(state: AgentState):
     query = state["messages"][-1].content
+    # CHANGED: Pull the session_id from the state
+    session_id = state.get("session_id", "default")
+    
     try:
-        collection = chroma_client.get_collection(name=f"docs_{state['user_id']}")
+        # CHANGED: Look up the collection for this specific session
+        collection = chroma_client.get_collection(name=f"docs_{state['user_id']}_{session_id}")
         results = collection.query(
             query_embeddings=embedding_model.encode([query]).tolist(),
             n_results=6
@@ -314,9 +322,13 @@ workflow.add_edge("blocked", END)
 
 multi_agent_app = workflow.compile()
 
-async def ask_agent_v2_stream(user_message, user_id, history=None):
+# CHANGED: Added session_id parameter
+async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="default"):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
         yield ("answer", "Invalid user identity.")
+        return
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
+        yield ("answer", "Invalid session.")
         return
 
     if history is None:
@@ -331,7 +343,8 @@ async def ask_agent_v2_stream(user_message, user_id, history=None):
             
     history_messages.append(HumanMessage(content=user_message[:100_000]))
 
-    inputs = {"messages": history_messages, "user_id": user_id}
+    # CHANGED: Pass session_id into the graph state
+    inputs = {"messages": history_messages, "user_id": user_id, "session_id": session_id}
     
     decision = "writer"
     for event in multi_agent_app.stream(inputs, stream_mode="updates"):
@@ -348,7 +361,7 @@ async def ask_agent_v2_stream(user_message, user_id, history=None):
     
     await asyncio.sleep(0.2)
 
-    state = {"messages": history_messages, "user_id": user_id, "next_agent": ""}
+    state = {"messages": history_messages, "user_id": user_id, "next_agent": "", "session_id": session_id}
     
     if decision == "web":
         yield ("step", "🌐 **Web Worker**...")

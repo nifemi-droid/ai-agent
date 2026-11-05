@@ -319,7 +319,9 @@ def main_page(session: str = None):
                     async def handle_file_event(e):
                         file_name = e.args['name']
                         file_data = e.args['data']
-                        res = await ui.run.io_bound(ingest_files, [{"name": file_name, "data": file_data}], USER_ID)
+                        session_id = app.storage.user['current_session']
+                        
+                        res = await ui.run.io_bound(ingest_files, [{"name": file_name, "data": file_data}], USER_ID, session_id)
                         ui.notify(res, type='info')
                         with chat_box:
                             with ui.row().classes('w-full justify-center'):
@@ -334,7 +336,7 @@ def main_page(session: str = None):
 
                     with ui.row().classes('w-full justify-between items-center'):
                         with ui.row().classes('gap-2 items-center'):
-                            # The native HTML label. The browser handles the click.
+                            # Native HTML label for attach
                             ui.add_body_html('''
                                 <label class="custom-attach-label">
                                     <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
@@ -376,6 +378,7 @@ def main_page(session: str = None):
                             return
                         
                         history = load_messages(app.storage.user['current_session'], USER_ID)
+                        session_id = app.storage.user['current_session']
                         
                         input_box.value = ''
                         save_message(app.storage.user['current_session'], 'user', prompt, USER_ID)
@@ -410,7 +413,9 @@ def main_page(session: str = None):
                         try:
                             current_task = asyncio.current_task()
                             history = load_messages(app.storage.user['current_session'], USER_ID)
-                            async for kind, content in ask_agent_v2_stream(prompt, USER_ID, history):
+                            session_id = app.storage.user['current_session']
+                            
+                            async for kind, content in ask_agent_v2_stream(prompt, USER_ID, history, session_id):
                                 if kind == "step":
                                     status.text = content
                                 elif kind == "chunk":
@@ -543,7 +548,10 @@ def settings_page():
                     delete_session(sid, USER_ID)
                 try:
                     from multi_agent import chroma_client
-                    chroma_client.delete_collection(name=f"docs_{USER_ID}")
+                    # Delete all collections for this user
+                    for col in chroma_client.list_collections():
+                        if col.name.startswith(f"docs_{USER_ID}_"):
+                            chroma_client.delete_collection(name=col.name)
                 except Exception:
                     pass
                 ui.notify('All data cleared.', type='positive')
