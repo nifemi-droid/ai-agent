@@ -314,30 +314,31 @@ def main_page(session: str = None):
                         .props('outlined dense autogrow')\
                         .classes('w-full bg-transparent text-white pl-10')
 
+                    ui.add_body_html('''
+                        <input type="file" id="native-upload" accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" style="display: none;" />
+                        <script>
+                        document.getElementById('native-upload').addEventListener('change', function(e) {
+                            const file = e.target.files[0];
+                            if (file) {
+                                const reader = new FileReader();
+                                reader.onload = function(event) {
+                                    const base64Data = event.target.result.split(',')[1];
+                                    emitEvent('file_uploaded', {name: file.name, data: base64Data});
+                                };
+                                reader.readAsDataURL(file);
+                            }
+                            e.target.value = '';
+                        });
+                        </script>
+                    ''')
+
+                    # The NiceGUI row for the buttons
                     with ui.row().classes('w-full justify-between items-center'):
                         with ui.row().classes('gap-2 items-center'):
-                            # Native HTML label + input trigger
-                            ui.add_body_html('''
-                                <label class="custom-file-upload" id="html-attach-label" style="position: absolute; bottom: 82px; left: 22px; z-index: 1000; cursor: pointer; color: #9ca3af;">
-                                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
-                                    <input type="file" id="native-upload" accept=".pdf,.docx,.doc,.txt,.md,.csv,.xlsx,.xls,.pptx" style="display: none;" />
-                                </label>
-                                <script>
-                                    document.getElementById('native-upload').addEventListener('change', function(e) {
-                                        const file = e.target.files[0];
-                                        if (file) {
-                                            const reader = new FileReader();
-                                            reader.onload = function(event) {
-                                                const base64Data = event.target.result.split(',')[1];
-                                                emitEvent('file_uploaded', {name: file.name, data: base64Data});
-                                            };
-                                            reader.readAsDataURL(file);
-                                        }
-                                        e.target.value = '';
-                                    });
-                                </script>
-                            ''')
-                            
+                            # Native NiceGUI button that triggers the hidden input
+                            ui.button('📎', on_click=lambda: ui.run_javascript('document.getElementById("native-upload").click()'))\
+                                .props('flat dense color=grey-5 text-lg')
+
                         with ui.row().classes('gap-2'):
                             stop_btn = ui.button('Stop', on_click=lambda: stop_generation()).props('flat dense color=red-400').classes('hidden')
                             send_btn = ui.button('Send', on_click=lambda: send()).props('flat dense color=blue-400')
