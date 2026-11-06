@@ -11,15 +11,21 @@ async def on_chat_start():
     cl.user_session.set("show_sources", True)
     cl.user_session.set("last_prompt", "")
     
+    # --- THE COMPLETE PM TOOLBOX ---
     actions = [
-        cl.Action(name="tool_prd", value="prd", label="📝 Write a PRD", payload={}),
-        cl.Action(name="tool_ai", value="ai", label="🤖 Design an AI Spec", payload={}),
+        cl.Action(name="tool_prd", value="prd", label="📝 PRD", payload={}),
+        cl.Action(name="tool_frd", value="frd", label="📊 FRD", payload={}),
+        cl.Action(name="tool_ai", value="ai", label="🤖 AI Spec", payload={}),
+        cl.Action(name="tool_platform", value="platform", label="⚙️ Platform Spec", payload={}),
+        cl.Action(name="tool_strategy", value="strategy", label="📈 Strategy Memo", payload={}),
+        cl.Action(name="tool_experiment", value="experiment", label="🧪 Experiment", payload={}),
+        cl.Action(name="tool_competitor", value="competitor", label="🔍 Competitor", payload={}),
         cl.Action(name="open_settings", value="open", label="⚙️ Settings", payload={})
     ]
     
     await cl.Message(
         content="✦ **Nexus** — Your Technical PM Co-pilot.\n\n"
-                "Select a tool below to start, or just type your question.",
+                "Select a PM artifact below to start, or just type your question.",
         actions=actions
     ).send()
 
@@ -36,14 +42,34 @@ async def on_chat_resume(thread):
 # --- TOOLBOX CALLBACKS ---
 @cl.action_callback("tool_prd")
 async def on_tool_prd(action: cl.Action):
-    await cl.Message(content="📝 **PRD Mode Activated**\n\nPlease describe the feature you want a PRD for.").send()
+    await cl.Message(content="📝 **PRD Mode Activated**\n\nPlease describe the feature you want a PRD for. (e.g., 'A two-factor authentication system for enterprise users')").send()
+
+@cl.action_callback("tool_frd")
+async def on_tool_frd(action: cl.Action):
+    await cl.Message(content="📊 **FRD Mode Activated**\n\nPlease describe the feature you want an FRD for.").send()
 
 @cl.action_callback("tool_ai")
 async def on_tool_ai(action: cl.Action):
-    await cl.Message(content="🤖 **AI Spec Mode Activated**\n\nPlease describe the AI/ML product.").send()
+    await cl.Message(content="🤖 **AI Spec Mode Activated**\n\nPlease describe the AI/ML product. I will include model choice, eval metrics, and guardrails.").send()
+
+@cl.action_callback("tool_platform")
+async def on_tool_platform(action: cl.Action):
+    await cl.Message(content="⚙️ **Platform Spec Mode Activated**\n\nPlease describe the internal platform or API. I will include SLOs, API contracts, and Build vs Buy analysis.").send()
+
+@cl.action_callback("tool_strategy")
+async def on_tool_strategy(action: cl.Action):
+    await cl.Message(content="📈 **Strategy Memo Mode Activated**\n\nWhat product or market are you trying to strategize on? (e.g., 'How should we price our new AI tier?')").send()
+
+@cl.action_callback("tool_experiment")
+async def on_tool_experiment(action: cl.Action):
+    await cl.Message(content="🧪 **Experiment Mode Activated**\n\nWhat hypothesis do you want to test? I will design the metrics, control group, and rollout plan.").send()
+
+@cl.action_callback("tool_competitor")
+async def on_tool_competitor(action: cl.Action):
+    await cl.Message(content="🔍 **Competitor Teardown Activated**\n\nWhich company do you want me to analyze? I will search the web and produce a PM-focused teardown.").send()
 
 
-# --- DEEP DIVE CALLBACK (NEW) ---
+# --- DEEP DIVE CALLBACK ---
 @cl.action_callback("deep_dive")
 async def on_deep_dive(action: cl.Action):
     last_prompt = cl.user_session.get("last_prompt", "")
@@ -111,7 +137,6 @@ async def on_message(message: cl.Message):
     verbose_mode = cl.user_session.get("verbose_mode", False)
     show_sources = cl.user_session.get("show_sources", True)
 
-    # Save the last prompt so Deep Dive can use it
     if message.content:
         cl.user_session.set("last_prompt", message.content)
 
@@ -147,7 +172,6 @@ async def on_message(message: cl.Message):
     got_answer = False
     
     try:
-        # Default to fast mode
         async for kind, content in ask_agent_v2_stream(
             message.content, user_id, history, session_id, deep_dive=False
         ):
@@ -186,10 +210,9 @@ async def on_message(message: cl.Message):
     history.append({"role": "assistant", "content": final_answer.content})
     cl.user_session.set("history", history)
     
-    # Add the Deep Dive button after the response
     await cl.Message(
         content="Want a more rigorous version of this?",
         actions=[
-            cl.Action(name="deep_dive", value="deep", label="🔬 Run Deep Dive (Draft → Critique → Refine)", payload={})
+            cl.Action(name="deep_dive", value="deep", label="🔬 Run Deep Dive", payload={})
         ]
     ).send()
