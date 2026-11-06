@@ -178,8 +178,8 @@ For AI/ML products, always include: model choice rationale, eval metrics, guardr
 For Platform products, always include: API contracts, SLOs/SLAs, and Build vs. Buy analysis.
 """
 
-# --- OPTIMIZED 3-STEP CHAIN (Manager -> Writer -> Refine) ---
-async def writer_worker_stream(state: AgentState):
+# --- WRITER WITH DEEP DIVE SUPPORT ---
+async def writer_worker_stream(state: AgentState, deep_dive=False):
     history = state["messages"][-5:]
     query = history[-1].content.lower()
     
@@ -199,39 +199,53 @@ async def writer_worker_stream(state: AgentState):
         artifact_type = "Strategy Doc"
         framework = "Situation Analysis, Market Context, Options, Recommendation, Roadmap"
 
-    # --- STEP 1: FAST DRAFT (No pre-flight check to save time) ---
-    draft_prompt = f"""
-    Draft a {artifact_type} based on the request below.
-    Framework: {framework}.
-    User Request: {query}
-    
-    Provide a structured outline with bullet points. Do not write the full document yet.
-    """
-    messages_draft = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=draft_prompt)]
-    draft_text = ""
-    async for chunk in stream_llm(messages_draft):
-        draft_text += chunk
+    if not deep_dive:
+        # FAST MODE: Stream directly, no draft/critique
+        prompt = f"""
+        Write a comprehensive {artifact_type} based on the framework below.
+        Framework: {framework}.
+        User Request: {query}
+        
+        Instructions:
+        - Use Markdown headers and tables.
+        - Be specific and rigorous.
+        - Do not use filler words.
+        """
+        messages = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=prompt)]
+        async for chunk in stream_llm(messages):
+            yield chunk
+    else:
+        # DEEP DIVE: Full Draft -> Critique -> Refine chain
+        draft_prompt = f"""
+        Draft the core sections of a {artifact_type}. 
+        Framework: {framework}.
+        User Request: {query}
+        Provide a structured outline with bullet points.
+        """
+        messages_draft = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=draft_prompt)]
+        draft_text = ""
+        async for chunk in stream_llm(messages_draft):
+            draft_text += chunk
 
-    # --- STEP 2: CRITIQUE & REFINE (Combined into one call) ---
-    refine_prompt = f"""
-    You are finalizing a {artifact_type}.
-    
-    Original Draft:
-    {draft_text}
-    
-    Instructions:
-    1. Internally critique the draft: What is missing? Are the metrics SMART? Is the rollout realistic?
-    2. Address those critiques.
-    3. Expand the outline into a full, comprehensive Markdown document.
-    4. Ensure every section from the framework is present: {framework}.
-    5. Use tables for metrics and requirements.
-    
-    User Request: {query}
-    """
-    messages_refine = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=refine_prompt)]
-    
-    async for chunk in stream_llm(messages_refine):
-        yield chunk
+        critique_prompt = f"""
+        You are a VP of Product reviewing a draft {artifact_type}.
+        Draft: {draft_text}
+        Critique the draft. What is missing? Are the metrics SMART?
+        """
+        messages_critique = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=critique_prompt)]
+        critique_text = ""
+        async for chunk in stream_llm(messages_critique):
+            critique_text += chunk
+
+        refine_prompt = f"""
+        Finalize a {artifact_type}.
+        Draft: {draft_text}
+        Critique: {critique_text}
+        Instructions: Address all critiques, expand into full Markdown, include all framework sections: {framework}.
+        """
+        messages_refine = [SystemMessage(content=PM_SYSTEM_PROMPT), HumanMessage(content=refine_prompt)]
+        async for chunk in stream_llm(messages_refine):
+            yield chunk
 
 async def web_worker_stream(state: AgentState):
     query = state["messages"][-1].content
@@ -246,51 +260,20 @@ async def web_worker_stream(state: AgentState):
             ])
             urls = [r['url'] for r in res['results']]
             
-            eval_prompt = f"""
-            You are a research assistant. The user asked: "{query}"
-            Here are the search results:
+            prompt = f"""{PM_SYSTEM_PROMPT}
+            You are doing market research. Answer with comprehensive depth:
+            {query}
+            Here is the raw research data:
             {context}
-            Do these results contain enough specific information to answer the user's question comprehensively?
-            Reply with exactly one word: 'YES' or 'NO'.
-            """
-            eval_response = llm.invoke([HumanMessage(content=eval_prompt)])
-            decision = eval_response.content.strip().upper()
+            Produce a COMPREHENSIVE research brief with: Executive Summary, Key Findings, Implications for PM, Competitive Landscape, Open Questions."""
             
-            if "YES" in decision:
-                prompt = f"""{PM_SYSTEM_PROMPT}
-                You are doing market research for a Principal Technical PM. Answer this question with comprehensive depth:
-                {query}
-                Here is the raw research data:
-                {context}
-                Produce a COMPREHENSIVE research brief:
-                1. **Executive Summary**
-                2. **Key Findings** (with specific data points)
-                3. **Implications for PM**
-                4. **Competitive Landscape**
-                5. **Open Questions**"""
+            async for chunk in stream_llm([HumanMessage(content=prompt)]):
+                yield chunk
                 
-                async for chunk in stream_llm([HumanMessage(content=prompt)]):
-                    yield chunk
-                    
-                if urls:
-                    yield "\n\n[SOURCES]" + "|".join(urls)
-                return
-                
-            else:
-                if attempt < max_retries - 1:
-                    refine_prompt = f"""
-                    The search query "{query}" didn't return good enough results.
-                    Based on the results we got, write a better, more specific search query.
-                    Reply with ONLY the new query, nothing else.
-                    """
-                    refine_response = llm.invoke([HumanMessage(content=refine_prompt)])
-                    query = refine_response.content.strip()
-                    print(f"🔄 Refining search query to: {query}")
-                else:
-                    yield "I could not find real-time data for this. However, based on my internal knowledge: \n\n"
-                    async for chunk in stream_llm([HumanMessage(content=f"Answer this based on your training data: {query}")]):
-                        yield chunk
-                    
+            if urls:
+                yield "\n\n[SOURCES]" + "|".join(urls)
+            return
+            
         except Exception as e:
             print(f"Network error on attempt {attempt+1}: {e}")
             if attempt == max_retries - 1:
@@ -336,12 +319,7 @@ async def doc_worker_stream(state: AgentState):
         {safe_context}
         </document>
         Question: {query}
-        Produce a COMPREHENSIVE answer:
-        1. **Direct Answer**
-        2. **Evidence from Document** (quote specific sections)
-        3. **Gaps & Ambiguities**
-        4. **Implications for PM**
-        5. **Recommended Next Steps**"""
+        Produce a COMPREHENSIVE answer with: Direct Answer, Evidence from Document, Gaps & Ambiguities, Implications for PM, Recommended Next Steps."""
         
         async for chunk in stream_llm([HumanMessage(content=prompt)]):
             yield chunk
@@ -382,7 +360,7 @@ workflow.add_edge("blocked", END)
 
 multi_agent_app = workflow.compile()
 
-async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="default"):
+async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="default", deep_dive=False):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
         yield ("answer", "Invalid user identity.")
         return
@@ -425,25 +403,25 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
                 decision = node_output.get("next_agent")
                 yield ("step", f"🧠 **Manager** → `{decision.upper()}`")
     
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0.1)
 
     state = {"messages": history_messages, "user_id": user_id, "next_agent": "", "session_id": session_id}
     
     full_response = ""
     
     if decision == "web":
-        yield ("step", "🌐 **Web Worker (Agentic Loop)**...")
+        yield ("step", "🌐 **Web Worker**...")
         async for chunk in web_worker_stream(state):
             full_response += chunk
             yield ("chunk", chunk)
     elif decision == "doc":
-        yield ("step", "📄 **Doc Worker (Hybrid Retrieval)**...")
+        yield ("step", "📄 **Doc Worker**...")
         async for chunk in doc_worker_stream(state):
             full_response += chunk
             yield ("chunk", chunk)
     else:
-        yield ("step", "✍️ **Writer Worker (Drafting → Refining)**...")
-        async for chunk in writer_worker_stream(state):
+        yield ("step", f"✍️ **Writer** ({'Deep Dive' if deep_dive else 'Fast'})...")
+        async for chunk in writer_worker_stream(state, deep_dive=deep_dive):
             full_response += chunk
             yield ("chunk", chunk)
             
