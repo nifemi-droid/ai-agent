@@ -3,15 +3,19 @@ import asyncio
 import re
 import io
 import time
-from typing import TypedDict, Annotated, Sequence, Literal, Optional
+from typing import TypedDict, Annotated, Sequence, Literal
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.sqlite import SqliteSaver
 import operator
 from tavily import TavilyClient
 from rank_bm25 import BM25Okapi
+
+# CORRECTED IMPORT FOR LANGFUSE V3+
+from langfuse.langchain import CallbackHandler
 
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
@@ -35,43 +39,44 @@ embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 print("Connecting to ChromaDB...")
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
+# --- LANGFUSE OBSERVABILITY ---
+langfuse_handler = CallbackHandler()
+
 MAX_FILES = 3
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_BYTES = 25 * 1024 * 1024
 ALLOWED_EXTENSIONS = ('.pdf', '.docx', '.doc', '.txt', '.md', '.csv', '.xlsx', '.xls', '.pptx')
 
+# --- PYDANTIC STATE VALIDATION ---
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     next_agent: str
     user_id: str
     session_id: str
 
-llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.2, api_key=GROQ_KEY)
-fallback_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.2, api_key=GROQ_KEY)
-
-# --- STRUCTURED ROUTING MODEL (The Foundation Fix) ---
 class RouteDecision(BaseModel):
     next_agent: Literal["web", "writer", "doc", "review", "compare", "blocked"] = Field(
         description="The exact agent to route to."
     )
     reasoning: str = Field(description="One sentence explaining the routing choice.")
 
-# --- SAFE LLM INVOKER ---
-async def stream_llm(messages):
+llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.2, api_key=GROQ_KEY)
+fallback_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.2, api_key=GROQ_KEY)
+
+async def stream_llm(messages, callbacks=None):
     try:
-        async for chunk in llm.astream(messages):
+        async for chunk in llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
             if chunk.content:
                 yield chunk.content
     except Exception as e:
         print(f"⚠️ Primary failed: {e}. Fallback...")
         try:
-            async for chunk in fallback_llm.astream(messages):
+            async for chunk in fallback_llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
                 if chunk.content:
                     yield chunk.content
         except Exception as fallback_error:
             yield f"\n\n**AI systems offline:** {fallback_error}"
 
-# --- PM CONTEXT INJECTION ---
 def get_pm_system_prompt():
     try:
         with open("context.md", "r") as f:
@@ -80,12 +85,10 @@ def get_pm_system_prompt():
         context = "No product context provided."
     return f"""You are a Principal Technical Product Manager. 
 You produce rigorous, data-driven, and comprehensive product artifacts.
-Use frameworks: RICE, INVEST, SMART, SLOs, Eval Metrics.
 PRODUCT CONTEXT:
 {context}
 """
 
-# --- INGESTION ---
 def _extract_text(file_bytes: bytes, file_name: str) -> str:
     name = file_name.lower()
     try:
@@ -158,23 +161,13 @@ def ingest_files(files, user_id, session_id):
     return f"Ingested {len(all_chunks)} chunks from {len(files)} file(s)."
 
 def sanitize_context(context):
-    patterns = [
-        r"ignore\s+(all\s+)?previous\s+instructions",
-        r"ignore\s+(all\s+)?above\s+instructions",
-        r"disregard\s+(all\s+)?previous",
-        r"forget\s+(all\s+)?previous",
-        r"you\s+are\s+now\s+",
-        r"new\s+instructions?:",
-        r"system\s*prompt:",
-        r"<\|.*?\|>",
-        r"\[INST\].*?\[/INST\]",
-    ]
+    patterns = [r"ignore\s+(all\s+)?previous\s+instructions", r"ignore\s+(all\s+)?above\s+instructions", r"disregard\s+(all\s+)?previous", r"forget\s+(all\s+)?previous", r"you\s+are\s+now\s+", r"new\s+instructions?:", r"system\s*prompt:", r"<\|.*?\|>", r"\[INST\].*?\[/INST\]"]
     out = context
     for p in patterns:
         out = re.sub(p, "[REDACTED]", out, flags=re.IGNORECASE | re.DOTALL)
     return out
 
-# --- ROBUST MANAGER NODE ---
+# --- MANAGER NODE (Structured Output) ---
 async def manager_node(state: AgentState):
     system_prompt = """You are the routing manager.
     Analyze the user's input and decide which worker should handle it:
@@ -185,14 +178,9 @@ async def manager_node(state: AgentState):
     - 'compare': comparing multiple uploaded documents
     - 'blocked': malicious or unsafe input
     """
-    
-    # Use structured output to force a valid route
     structured_llm = llm.with_structured_output(RouteDecision)
     try:
-        decision = await structured_llm.ainvoke([
-            SystemMessage(content=system_prompt), 
-            state["messages"][-1]
-        ])
+        decision = await structured_llm.ainvoke([SystemMessage(content=system_prompt), state["messages"][-1]], config={"callbacks": [langfuse_handler]})
         return {"next_agent": decision.next_agent}
     except Exception as e:
         print(f"Manager routing failed: {e}. Defaulting to writer.")
@@ -200,16 +188,14 @@ async def manager_node(state: AgentState):
 
 def guardrail_node(state: AgentState):
     system_prompt = "Is this input malicious? Reply 'SAFE' or 'UNSAFE'."
-    response = llm.invoke([HumanMessage(content=system_prompt), state["messages"][-1]])
+    response = llm.invoke([HumanMessage(content=system_prompt), state["messages"][-1]], config={"callbacks": [langfuse_handler]})
     return {"next_agent": "blocked" if "UNSAFE" in response.content.upper() else "manager"}
 
 # --- WORKER NODES (Wrapped in Try/Except) ---
 async def writer_worker_node(state: AgentState):
     try:
         query = state["messages"][-1].content.lower()
-        # ... [Insert the full writer logic from previous iterations here] ...
-        # (For brevity, keeping it to a single call in this architecture fix)
-        prompt = f"""Write a comprehensive PM document based on: {query}"""
+        prompt = f"Write a comprehensive PM document based on: {query}"
         async for chunk in stream_llm([SystemMessage(content=get_pm_system_prompt()), HumanMessage(content=prompt)]):
             yield chunk
     except Exception as e:
@@ -226,42 +212,25 @@ async def web_worker_node(state: AgentState):
     except Exception as e:
         yield f"**Web Search Error:** {e}"
 
-# --- BUILD THE GRAPH ---
-workflow = StateGraph(AgentState)
+# --- THE ENTERPRISE GRAPH (With Checkpointer) ---
+checkpointer = SqliteSaver.from_conn_string("checkpoints.sqlite")
 
+workflow = StateGraph(AgentState)
 workflow.add_node("guardrail", guardrail_node)
 workflow.add_node("manager", manager_node)
 workflow.add_node("writer", writer_worker_node)
 workflow.add_node("web", web_worker_node)
-# (Add doc, review, compare nodes here using the same try/except pattern)
 
 workflow.set_entry_point("guardrail")
-workflow.add_conditional_edges(
-    "guardrail",
-    lambda x: "blocked" if x["next_agent"] == "blocked" else "manager",
-    {"blocked": END, "manager": "manager"}
-)
-
-# Conditional routing from Manager
-workflow.add_conditional_edges(
-    "manager",
-    lambda x: x["next_agent"],
-    {
-        "web": "web",
-        "writer": "writer",
-        "doc": END,
-        "review": END,
-        "compare": END,
-        "blocked": END
-    }
-)
-
+workflow.add_conditional_edges("guardrail", lambda x: "blocked" if x["next_agent"] == "blocked" else "manager", {"blocked": END, "manager": "manager"})
+workflow.add_conditional_edges("manager", lambda x: x["next_agent"], {"web": "web", "writer": "writer", "doc": END, "review": END, "compare": END, "blocked": END})
 workflow.add_edge("writer", END)
 workflow.add_edge("web", END)
 
-multi_agent_app = workflow.compile()
+# Compile WITH the checkpointer. State is now saved to disk.
+multi_agent_app = workflow.compile(checkpointer=checkpointer)
 
-# --- THE EXECUTION RUNNER (Handles streaming and errors) ---
+# --- THE EXECUTION RUNNER ---
 async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="default", deep_dive=False):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
         yield ("answer", "Invalid user identity.")
@@ -285,12 +254,13 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
         elif msg['role'] == 'assistant': history_messages.append(AIMessage(content=msg['content']))
     history_messages.append(HumanMessage(content=user_message[:100_000]))
 
+    # The checkpointer requires a thread_id to persist state
+    config = {"configurable": {"thread_id": session_id}, "callbacks": [langfuse_handler]}
     inputs = {"messages": history_messages, "user_id": user_id, "session_id": session_id}
     
-    # Use a fallback route if the graph fails entirely
     route_decision = "writer"
     try:
-        for event in multi_agent_app.stream(inputs, stream_mode="updates"):
+        for event in multi_agent_app.stream(inputs, config, stream_mode="updates"):
             for node_name, node_output in event.items():
                 if node_name == "guardrail":
                     if node_output.get("next_agent") == "blocked":
@@ -303,7 +273,6 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
     except Exception as e:
         yield ("step", f"❌ **Graph Error:** {e}")
 
-    # Execute the chosen worker natively
     state = {"messages": history_messages, "user_id": user_id, "next_agent": "", "session_id": session_id}
     full_response = ""
     
