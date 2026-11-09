@@ -47,7 +47,6 @@ MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_BYTES = 25 * 1024 * 1024
 ALLOWED_EXTENSIONS = ('.pdf', '.docx', '.doc', '.txt', '.md', '.csv', '.xlsx', '.xls', '.pptx')
 
-# --- PYDANTIC STATE VALIDATION ---
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     next_agent: str
@@ -63,19 +62,54 @@ class RouteDecision(BaseModel):
 llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.2, api_key=GROQ_KEY)
 fallback_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.2, api_key=GROQ_KEY)
 
+# --- CIRCUIT BREAKER STATE ---
+primary_failures = 0
+circuit_tripped_at = 0
+CIRCUIT_THRESHOLD = 3
+CIRCUIT_RESET_SECONDS = 60
+
 async def stream_llm(messages, callbacks=None):
+    global primary_failures, circuit_tripped_at
+    
+    current_time = time.time()
+    
+    # Check if circuit is tripped
+    if primary_failures >= CIRCUIT_THRESHOLD:
+        if current_time - circuit_tripped_at < CIRCUIT_RESET_SECONDS:
+            print(f"🔌 Circuit breaker is OPEN. Routing directly to fallback (resets in {CIRCUIT_RESET_SECONDS - (current_time - circuit_tripped_at):.0f}s).")
+            try:
+                async for chunk in fallback_llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
+                    if chunk.content:
+                        yield chunk.content
+                return
+            except Exception as e:
+                yield f"\n\n**All AI systems offline:** {e}"
+                return
+        else:
+            # Reset the circuit after timeout
+            print("🔌 Circuit breaker resetting. Trying primary...")
+            primary_failures = 0
+
+    # Try primary
     try:
         async for chunk in llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
             if chunk.content:
                 yield chunk.content
+        # Success! Reset failure count
+        primary_failures = 0
     except Exception as e:
-        print(f"⚠️ Primary failed: {e}. Fallback...")
+        primary_failures += 1
+        if primary_failures >= CIRCUIT_THRESHOLD:
+            circuit_tripped_at = time.time()
+            print(f"🚨 Primary model failed {primary_failures} times. Circuit breaker tripped.")
+        
+        print(f"⚠️ Primary failed: {e}. Trying fallback...")
         try:
             async for chunk in fallback_llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
                 if chunk.content:
                     yield chunk.content
         except Exception as fallback_error:
-            yield f"\n\n**AI systems offline:** {fallback_error}"
+            yield f"\n\n**All AI systems offline:** {fallback_error}"
 
 def get_pm_system_prompt():
     try:
@@ -167,6 +201,32 @@ def sanitize_context(context):
         out = re.sub(p, "[REDACTED]", out, flags=re.IGNORECASE | re.DOTALL)
     return out
 
+# --- CONTEXT COMPRESSION ---
+async def compress_history(history):
+    if len(history) < 10:
+        return history
+        
+    print("🗜️ Compressing conversation history...")
+    recent = history[-4:]
+    old = history[:-4]
+    
+    summary_prompt = f"""
+    Summarize this past conversation into a concise 'handoff summary'. 
+    Include: Main Goal, Key Decisions, Constraints, and Next Steps.
+    
+    Conversation:
+    {old}
+    """
+    
+    try:
+        response = await llm.ainvoke([HumanMessage(content=summary_prompt)])
+        summary_text = response.content
+        summary_message = AIMessage(content=f"[Previous conversation summary]: {summary_text}")
+        return [{"role": "assistant", "content": summary_message.content}] + recent
+    except Exception as e:
+        print(f"Compression failed: {e}. Using raw history.")
+        return history
+
 # --- MANAGER NODE (Structured Output) ---
 async def manager_node(state: AgentState):
     system_prompt = """You are the routing manager.
@@ -227,7 +287,6 @@ workflow.add_conditional_edges("manager", lambda x: x["next_agent"], {"web": "we
 workflow.add_edge("writer", END)
 workflow.add_edge("web", END)
 
-# Compile WITH the checkpointer. State is now saved to disk.
 multi_agent_app = workflow.compile(checkpointer=checkpointer)
 
 # --- THE EXECUTION RUNNER ---
@@ -248,13 +307,15 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
             yield ("chunk", cached)
             return
 
+    # Compress history if it's getting too long
+    compressed_history = await compress_history(history)
+    
     history_messages = []
-    for msg in history:
+    for msg in compressed_history:
         if msg['role'] == 'user': history_messages.append(HumanMessage(content=msg['content']))
         elif msg['role'] == 'assistant': history_messages.append(AIMessage(content=msg['content']))
     history_messages.append(HumanMessage(content=user_message[:100_000]))
 
-    # The checkpointer requires a thread_id to persist state
     config = {"configurable": {"thread_id": session_id}, "callbacks": [langfuse_handler]}
     inputs = {"messages": history_messages, "user_id": user_id, "session_id": session_id}
     
