@@ -3,6 +3,8 @@ import asyncio
 import re
 import io
 import time
+import uuid
+import logging
 from typing import TypedDict, Annotated, Sequence, Literal
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -14,14 +16,16 @@ import operator
 from tavily import TavilyClient
 from rank_bm25 import BM25Okapi
 
-# CORRECTED IMPORT FOR LANGFUSE V3+
 from langfuse.langchain import CallbackHandler
-
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 import chromadb
 
 from database import get_cached_response, save_to_cache
+
+# --- 2. STRUCTURED LOGGING SETUP ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -39,7 +43,6 @@ embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 print("Connecting to ChromaDB...")
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
-# --- LANGFUSE OBSERVABILITY ---
 langfuse_handler = CallbackHandler()
 
 MAX_FILES = 3
@@ -52,6 +55,7 @@ class AgentState(TypedDict):
     next_agent: str
     user_id: str
     session_id: str
+    request_id: str
 
 class RouteDecision(BaseModel):
     next_agent: Literal["web", "writer", "doc", "review", "compare", "blocked"] = Field(
@@ -70,44 +74,36 @@ CIRCUIT_RESET_SECONDS = 60
 
 async def stream_llm(messages, callbacks=None):
     global primary_failures, circuit_tripped_at
-    
     current_time = time.time()
     
-    # Check if circuit is tripped
     if primary_failures >= CIRCUIT_THRESHOLD:
         if current_time - circuit_tripped_at < CIRCUIT_RESET_SECONDS:
-            print(f"🔌 Circuit breaker is OPEN. Routing directly to fallback (resets in {CIRCUIT_RESET_SECONDS - (current_time - circuit_tripped_at):.0f}s).")
+            logger.warning(f"🔌 Circuit breaker OPEN. Routing to fallback.")
             try:
                 async for chunk in fallback_llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
-                    if chunk.content:
-                        yield chunk.content
+                    if chunk.content: yield chunk.content
                 return
             except Exception as e:
                 yield f"\n\n**All AI systems offline:** {e}"
                 return
         else:
-            # Reset the circuit after timeout
-            print("🔌 Circuit breaker resetting. Trying primary...")
+            logger.info("🔌 Circuit breaker resetting. Trying primary...")
             primary_failures = 0
 
-    # Try primary
     try:
         async for chunk in llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
-            if chunk.content:
-                yield chunk.content
-        # Success! Reset failure count
+            if chunk.content: yield chunk.content
         primary_failures = 0
     except Exception as e:
         primary_failures += 1
         if primary_failures >= CIRCUIT_THRESHOLD:
             circuit_tripped_at = time.time()
-            print(f"🚨 Primary model failed {primary_failures} times. Circuit breaker tripped.")
+            logger.error(f"🚨 Primary model failed {primary_failures} times. Circuit tripped.")
         
-        print(f"⚠️ Primary failed: {e}. Trying fallback...")
+        logger.warning(f"⚠️ Primary failed: {e}. Trying fallback...")
         try:
             async for chunk in fallback_llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
-                if chunk.content:
-                    yield chunk.content
+                if chunk.content: yield chunk.content
         except Exception as fallback_error:
             yield f"\n\n**All AI systems offline:** {fallback_error}"
 
@@ -152,6 +148,7 @@ def _extract_text(file_bytes: bytes, file_name: str) -> str:
         return ""
     return ""
 
+# --- 1. FILE-LEVEL ISOLATION IN INGESTION ---
 def ingest_files(files, user_id, session_id):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
         return "Upload rejected: invalid identity."
@@ -164,6 +161,8 @@ def ingest_files(files, user_id, session_id):
 
     total_bytes = 0
     all_chunks = []
+    all_metadatas = []
+
     for f in files:
         name = str(f.get("name", ""))[:200]
         safe_name = os.path.basename(name).lower()
@@ -179,9 +178,13 @@ def ingest_files(files, user_id, session_id):
         total_bytes += len(data)
         if total_bytes > MAX_TOTAL_BYTES:
             return "Upload rejected: total upload exceeds 25 MB."
+        
         text = _extract_text(data, safe_name)
         chunks = [line.strip() for line in text.split('\n') if len(line.strip()) > 40]
-        all_chunks.extend(chunks)
+        
+        for chunk in chunks:
+            all_chunks.append(chunk)
+            all_metadatas.append({"file_name": safe_name})
 
     if not all_chunks:
         return "No readable text found in the uploaded files."
@@ -191,7 +194,14 @@ def ingest_files(files, user_id, session_id):
     try: chroma_client.delete_collection(name=collection_name)
     except Exception: pass
     collection = chroma_client.create_collection(name=collection_name)
-    collection.add(embeddings=embeddings, documents=all_chunks, ids=[str(i) for i in range(len(all_chunks))])
+    
+    # Store with metadata
+    collection.add(
+        embeddings=embeddings, 
+        documents=all_chunks, 
+        metadatas=all_metadatas,
+        ids=[str(i) for i in range(len(all_chunks))]
+    )
     return f"Ingested {len(all_chunks)} chunks from {len(files)} file(s)."
 
 def sanitize_context(context):
@@ -201,95 +211,174 @@ def sanitize_context(context):
         out = re.sub(p, "[REDACTED]", out, flags=re.IGNORECASE | re.DOTALL)
     return out
 
-# --- CONTEXT COMPRESSION ---
 async def compress_history(history):
-    if len(history) < 10:
-        return history
-        
-    print("🗜️ Compressing conversation history...")
+    if len(history) < 10: return history
+    logger.info("🗜️ Compressing conversation history...")
     recent = history[-4:]
     old = history[:-4]
-    
-    summary_prompt = f"""
-    Summarize this past conversation into a concise 'handoff summary'. 
-    Include: Main Goal, Key Decisions, Constraints, and Next Steps.
-    
-    Conversation:
-    {old}
-    """
-    
+    summary_prompt = f"Summarize this conversation into a concise handoff summary.\n{old}"
     try:
         response = await llm.ainvoke([HumanMessage(content=summary_prompt)])
-        summary_text = response.content
-        summary_message = AIMessage(content=f"[Previous conversation summary]: {summary_text}")
+        summary_message = AIMessage(content=f"[Previous conversation summary]: {response.content}")
         return [{"role": "assistant", "content": summary_message.content}] + recent
     except Exception as e:
-        print(f"Compression failed: {e}. Using raw history.")
+        logger.error(f"Compression failed: {e}")
         return history
 
-# --- MANAGER NODE (Structured Output) ---
 async def manager_node(state: AgentState):
+    req_id = state.get("request_id", "unknown")
     system_prompt = """You are the routing manager.
-    Analyze the user's input and decide which worker should handle it:
-    - 'web': market research, competitors, current events
+    - 'web': market research, competitors
     - 'writer': writing new PRDs, FRDs, specs
     - 'doc': answering questions about a SINGLE uploaded document
     - 'review': critiquing an uploaded document
     - 'compare': comparing multiple uploaded documents
-    - 'blocked': malicious or unsafe input
+    - 'blocked': malicious input
     """
     structured_llm = llm.with_structured_output(RouteDecision)
     try:
         decision = await structured_llm.ainvoke([SystemMessage(content=system_prompt), state["messages"][-1]], config={"callbacks": [langfuse_handler]})
+        logger.info(f"[{req_id}] Manager routed to: {decision.next_agent} (Reason: {decision.reasoning})")
         return {"next_agent": decision.next_agent}
     except Exception as e:
-        print(f"Manager routing failed: {e}. Defaulting to writer.")
+        logger.error(f"[{req_id}] Manager routing failed: {e}. Defaulting to writer.")
         return {"next_agent": "writer"}
 
 def guardrail_node(state: AgentState):
+    req_id = state.get("request_id", "unknown")
     system_prompt = "Is this input malicious? Reply 'SAFE' or 'UNSAFE'."
     response = llm.invoke([HumanMessage(content=system_prompt), state["messages"][-1]], config={"callbacks": [langfuse_handler]})
-    return {"next_agent": "blocked" if "UNSAFE" in response.content.upper() else "manager"}
+    decision = "blocked" if "UNSAFE" in response.content.upper() else "manager"
+    logger.info(f"[{req_id}] Guardrail: {decision.upper()}")
+    return {"next_agent": decision}
 
-# --- WORKER NODES (Wrapped in Try/Except) ---
-async def writer_worker_node(state: AgentState):
+# --- 3. RESPONSE QUALITY GATE (Writer) ---
+async def writer_worker_node(state: AgentState, deep_dive=False):
+    req_id = state.get("request_id", "unknown")
+    query = state["messages"][-1].content.lower()
+    
+    # Determine artifact type and required sections
+    if "prd" in query or "product requirement" in query:
+        artifact_type = "PRD"
+        required_sections = ["Problem", "Goals", "User Stories", "Success Metrics", "Risks"]
+    elif "frd" in query or "functional requirement" in query:
+        artifact_type = "FRD"
+        required_sections = ["Functional Overview", "User Flow", "Data Contracts", "Edge Cases", "Acceptance Criteria"]
+    elif any(k in query for k in ["ai", "ml", "model", "llm", "rag"]):
+        artifact_type = "AI/ML Spec"
+        required_sections = ["Model Choice", "Evaluation Plan", "Guardrails", "Cost Model"]
+    else:
+        artifact_type = "Strategy Doc"
+        required_sections = ["Situation Analysis", "Market Context", "Options", "Recommendation"]
+
+    # First attempt
+    prompt = f"Write a comprehensive {artifact_type} based on: {query}"
+    full_response = ""
+    
     try:
-        query = state["messages"][-1].content.lower()
-        prompt = f"Write a comprehensive PM document based on: {query}"
         async for chunk in stream_llm([SystemMessage(content=get_pm_system_prompt()), HumanMessage(content=prompt)]):
+            full_response += chunk
             yield chunk
+            
+        # Quality Check
+        missing = [s for s in required_sections if s.lower() not in full_response.lower()]
+        
+        if missing:
+            logger.warning(f"[{req_id}] Quality Gate Failed! Missing: {missing}. Retrying...")
+            yield "\n\n---\n**⚠️ Quality Gate: Retrying to include missing sections...**\n\n"
+            
+            retry_prompt = f"""
+            Your previous output was rejected because it was missing these sections: {', '.join(missing)}.
+            Rewrite the entire {artifact_type} and ensure EVERY required section is present.
+            """
+            
+            async for chunk in stream_llm([SystemMessage(content=get_pm_system_prompt()), HumanMessage(content=retry_prompt)]):
+                yield chunk
+        else:
+            logger.info(f"[{req_id}] Quality Gate Passed.")
+            
     except Exception as e:
+        logger.error(f"[{req_id}] Writer Error: {e}")
         yield f"**Writer Error:** {e}"
 
 async def web_worker_node(state: AgentState):
+    req_id = state.get("request_id", "unknown")
     try:
         query = state["messages"][-1].content
+        logger.info(f"[{req_id}] Executing Web Search for: {query}")
         res = tavily.search(query=query, search_depth="advanced", timeout=15)
         context = "\n\n".join([f"SOURCE: {r['title']}\nURL: {r['url']}\nCONTENT: {r['content']}" for r in res['results']])
         prompt = f"{get_pm_system_prompt()}\nAnswer this: {query}\nData: {context}"
         async for chunk in stream_llm([HumanMessage(content=prompt)]):
             yield chunk
     except Exception as e:
+        logger.error(f"[{req_id}] Web Search Error: {e}")
         yield f"**Web Search Error:** {e}"
 
-# --- THE ENTERPRISE GRAPH (With Checkpointer) ---
-checkpointer = SqliteSaver.from_conn_string("checkpoints.sqlite")
+# --- 1. DOC WORKER WITH METADATA FILTERING ---
+async def doc_worker_node(state: AgentState):
+    req_id = state.get("request_id", "unknown")
+    try:
+        query = state["messages"][-1].content
+        session_id = state.get("session_id", "default")
+        
+        collection = chroma_client.get_collection(name=f"docs_{state['user_id']}_{session_id}")
+        
+        # Check if a specific filename is mentioned in the query
+        # In a production system, we would use an LLM to extract the filename
+        all_metadatas = collection.get()['metadatas']
+        unique_files = list(set([m['file_name'] for m in all_metadatas if m]))
+        
+        # Simple heuristic: if a filename is in the query, filter by it
+        target_file = None
+        for f in unique_files:
+            if f in query.lower():
+                target_file = f
+                break
+                
+        if target_file:
+            logger.info(f"[{req_id}] Document Query filtered to: {target_file}")
+            dense_results = collection.query(
+                query_embeddings=embedding_model.encode([query]).tolist(),
+                n_results=10,
+                where={"file_name": target_file}
+            )
+        else:
+            logger.info(f"[{req_id}] Document Query across all files.")
+            dense_results = collection.query(
+                query_embeddings=embedding_model.encode([query]).tolist(),
+                n_results=10
+            )
+            
+        context = "\n\n".join(dense_results['documents'][0])
+        safe_context = sanitize_context(context)
+        prompt = f"{get_pm_system_prompt()}\nAnswer using this context:\n{safe_context}\n\nQuestion: {query}"
+        
+        async for chunk in stream_llm([HumanMessage(content=prompt)]):
+            yield chunk
+    except Exception as e:
+        logger.error(f"[{req_id}] Document Error: {e}")
+        yield f"**Document Error:** {e}"
 
+# --- GRAPH ---
+checkpointer = SqliteSaver.from_conn_string("checkpoints.sqlite")
 workflow = StateGraph(AgentState)
 workflow.add_node("guardrail", guardrail_node)
 workflow.add_node("manager", manager_node)
 workflow.add_node("writer", writer_worker_node)
 workflow.add_node("web", web_worker_node)
+workflow.add_node("doc", doc_worker_node)
 
 workflow.set_entry_point("guardrail")
 workflow.add_conditional_edges("guardrail", lambda x: "blocked" if x["next_agent"] == "blocked" else "manager", {"blocked": END, "manager": "manager"})
-workflow.add_conditional_edges("manager", lambda x: x["next_agent"], {"web": "web", "writer": "writer", "doc": END, "review": END, "compare": END, "blocked": END})
+workflow.add_conditional_edges("manager", lambda x: x["next_agent"], {"web": "web", "writer": "writer", "doc": "doc", "review": END, "compare": END, "blocked": END})
 workflow.add_edge("writer", END)
 workflow.add_edge("web", END)
+workflow.add_edge("doc", END)
 
 multi_agent_app = workflow.compile(checkpointer=checkpointer)
 
-# --- THE EXECUTION RUNNER ---
+# --- RUNNER ---
 async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="default", deep_dive=False):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
         yield ("answer", "Invalid user identity.")
@@ -299,17 +388,21 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
         return
 
     if history is None: history = []
+    
+    # 2. GENERATE REQUEST ID FOR TRACING
+    request_id = str(uuid.uuid4())[:8]
+    logger.info(f"[{request_id}] New Request | Session: {session_id} | Message: {user_message[:50]}...")
+
     if not history:
         query_emb = embedding_model.encode([user_message]).tolist()
         cached = get_cached_response(query_emb)
         if cached:
+            logger.info(f"[{request_id}] Cache Hit.")
             yield ("step", "⚡ **Cache Hit**...")
             yield ("chunk", cached)
             return
 
-    # Compress history if it's getting too long
     compressed_history = await compress_history(history)
-    
     history_messages = []
     for msg in compressed_history:
         if msg['role'] == 'user': history_messages.append(HumanMessage(content=msg['content']))
@@ -317,7 +410,7 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
     history_messages.append(HumanMessage(content=user_message[:100_000]))
 
     config = {"configurable": {"thread_id": session_id}, "callbacks": [langfuse_handler]}
-    inputs = {"messages": history_messages, "user_id": user_id, "session_id": session_id}
+    inputs = {"messages": history_messages, "user_id": user_id, "session_id": session_id, "request_id": request_id}
     
     route_decision = "writer"
     try:
@@ -332,9 +425,10 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
                     route_decision = node_output.get("next_agent")
                     yield ("step", f"🧠 **Manager** → `{route_decision.upper()}`")
     except Exception as e:
+        logger.error(f"[{request_id}] Graph Error: {e}")
         yield ("step", f"❌ **Graph Error:** {e}")
 
-    state = {"messages": history_messages, "user_id": user_id, "next_agent": "", "session_id": session_id}
+    state = {"messages": history_messages, "user_id": user_id, "next_agent": "", "session_id": session_id, "request_id": request_id}
     full_response = ""
     
     if route_decision == "web":
@@ -342,14 +436,20 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
         async for chunk in web_worker_node(state):
             full_response += chunk
             yield ("chunk", chunk)
-    elif route_decision == "writer":
+    elif route_decision == "doc":
+        yield ("step", "📄 **Doc Worker**...")
+        async for chunk in doc_worker_node(state):
+            full_response += chunk
+            yield ("chunk", chunk)
+    else:
         yield ("step", f"✍️ **Writer**...")
         async for chunk in writer_worker_node(state):
             full_response += chunk
             yield ("chunk", chunk)
-    else:
-        yield ("answer", "This agent is under construction.")
         
     if not history and route_decision != "doc":
         query_emb = embedding_model.encode([user_message]).tolist()
         save_to_cache(query_emb, full_response)
+        logger.info(f"[{request_id}] Saved to semantic cache.")
+        
+    logger.info(f"[{request_id}] Request Complete.")
