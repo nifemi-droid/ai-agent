@@ -13,7 +13,7 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 import operator
 from tavily import TavilyClient
-from rank_bm25 import BM25Okapi
+from mxbai_rerank import MxbaiRerankV2
 
 from langfuse.langchain import CallbackHandler
 from pypdf import PdfReader
@@ -37,6 +37,11 @@ tavily = TavilyClient(api_key=TAVILY_KEY)
 print("Loading embedding model...")
 os.environ["HF_HUB_OFFLINE"] = "1"
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+print("Loading reranker model (mxbai-rerank-base-v2)...")
+# Initialize the reranker once at startup. It runs locally on CPU for free.
+reranker = MxbaiRerankV2("mixedbread-ai/mxbai-rerank-base-v2")
+
 print("Connecting to ChromaDB...")
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
 
@@ -77,16 +82,13 @@ def sanitize_input(text: str) -> tuple[bool, str]:
 
 # --- 1. DETERMINISTIC PRE-ROUTER ---
 def pre_router(message: str, has_files: bool) -> str:
-    """Route deterministically before the LLM is even called."""
     msg = message.lower().strip()
-    
     if msg.startswith("/web") or "search the web" in msg or "latest news" in msg:
         return "web"
     if has_files:
         return "doc"
     if msg.startswith("/doc") or "uploaded document" in msg:
         return "doc"
-    
     return "auto"
 
 # --- 2. NATIVE TOOL SCHEMAS ---
@@ -131,43 +133,65 @@ async def execute_web_search(query: str) -> str:
     except Exception as e:
         return f"Web search failed: {e}"
 
+# --- UPGRADE: DOCUMENT SEARCH WITH RERANKING ---
 def execute_search_documents(query: str, user_id: str, session_id: str, file_name: str = None) -> str:
     try:
         collection = chroma_client.get_collection(name=f"docs_{user_id}_{session_id}")
+        
+        # Step 1: Retrieve a larger candidate set (e.g., top 20) from ChromaDB
         if file_name:
-            results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=10, where={"file_name": file_name})
+            results = collection.query(
+                query_embeddings=embedding_model.encode([query]).tolist(), 
+                n_results=20, 
+                where={"file_name": file_name}
+            )
         else:
-            results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=10)
-        return "\n\n".join(results['documents'][0])[:MAX_TOOL_OUTPUT_CHARS]
+            results = collection.query(
+                query_embeddings=embedding_model.encode([query]).tolist(), 
+                n_results=20
+            )
+        
+        candidate_chunks = results['documents'][0]
+        
+        if not candidate_chunks:
+            return "No relevant documents found."
+        
+        # Step 2: Rerank the candidates using the cross-encoder
+        # The reranker scores each (query, chunk) pair jointly for better precision.
+        ranked_results = reranker.rank(
+            query=query, 
+            documents=candidate_chunks, 
+            top_k=5  # Return only the top 5 most relevant chunks
+        )
+        
+        # Step 3: Extract the top chunks and join them
+        top_chunks = [result.document for result in ranked_results]
+        context = "\n\n".join(top_chunks)
+        
+        logger.info(f"Reranked {len(candidate_chunks)} candidates down to {len(top_chunks)} chunks.")
+        return context[:MAX_TOOL_OUTPUT_CHARS]
+        
     except Exception as e:
+        logger.error(f"Document search/rerank failed: {e}")
         return f"Document search failed: {e}"
 
 # --- 3. TOKEN-BOUNDED CONTEXT ---
 def estimate_tokens(text: str) -> int:
-    """Rough estimate: 1 token ≈ 4 characters."""
     return len(text) // 4
 
 def compress_history(history: list, max_tokens: int = MAX_CONTEXT_TOKENS) -> list:
-    """Drop oldest messages until under the token limit."""
     total_tokens = sum(estimate_tokens(m['content']) for m in history)
-    
     if total_tokens <= max_tokens:
         return history
     
     logger.info(f"🗜️ Context too large ({total_tokens} tokens). Compressing...")
-    # Keep the most recent messages, drop from the front
     compressed = history[:]
-    while estimate_tokens_compressed(compressed) > max_tokens and len(compressed) > 2:
+    while sum(estimate_tokens(m['content']) for m in compressed) > max_tokens and len(compressed) > 2:
         compressed.pop(0)
-    
     return compressed
 
-def estimate_tokens_compressed(history: list) -> int:
-    return sum(estimate_tokens(m['content']) for m in history)
-
-# --- AGENT LOOP WITH NATIVE TOOL CALLING ---
-async def run_agent(user_message: str, user_id: str, session_id: str, history: list, pre_route: str = "auto") -> str:
-    # 3. COMPRESS HISTORY BEFORE SENDING
+# --- AGENT LOOP WITH NATIVE TOOL CALLING & STREAMING ---
+async def run_agent_stream(user_message: str, user_id: str, session_id: str, history: list, pre_route: str = "auto"):
     compressed_history = compress_history(history)
     
     messages = [
@@ -186,36 +210,38 @@ async def run_agent(user_message: str, user_id: str, session_id: str, history: l
     
     max_tool_calls = 3
     tool_call_count = 0
-    used_tool = False
     
     while tool_call_count < max_tool_calls:
-        try:
-            # 1. PRE-ROUTER: If deterministic route, force tool on first call
-            if tool_call_count == 0 and pre_route == "web":
-                response = await main_llm.ainvoke(messages, tools=[tools[0]], tool_choice={"type": "function", "function": {"name": "web_search"}}, config={"callbacks": [langfuse_handler]})
-            elif tool_call_count == 0 and pre_route == "doc":
-                response = await main_llm.ainvoke(messages, tools=[tools[1]], tool_choice={"type": "function", "function": {"name": "search_documents"}}, config={"callbacks": [langfuse_handler]})
-            else:
-                response = await main_llm.ainvoke(messages, tools=tools, config={"callbacks": [langfuse_handler]})
-        except Exception as e:
-            logger.error(f"LLM error: {e}. Trying fallback...")
-            try:
-                response = await fallback_llm.ainvoke(messages, tools=tools, config={"callbacks": [langfuse_handler]})
-            except Exception as fallback_error:
-                return f"**AI systems offline:** {fallback_error}"
+        if tool_call_count == 0 and pre_route == "web":
+            stream = main_llm.astream(messages, tools=[tools[0]], tool_choice={"type": "function", "function": {"name": "web_search"}}, config={"callbacks": [langfuse_handler]})
+        elif tool_call_count == 0 and pre_route == "doc":
+            stream = main_llm.astream(messages, tools=[tools[1]], tool_choice={"type": "function", "function": {"name": "search_documents"}}, config={"callbacks": [langfuse_handler]})
+        else:
+            stream = main_llm.astream(messages, tools=tools, config={"callbacks": [langfuse_handler]})
         
-        if not response.tool_calls:
-            return response.content
+        accumulated_content = ""
+        accumulated_tool_calls = []
+        
+        async for chunk in stream:
+            if chunk.content:
+                accumulated_content += chunk.content
+                yield ("chunk", chunk.content)
+            if chunk.tool_calls:
+                accumulated_tool_calls.extend(chunk.tool_calls)
+        
+        final_ai = AIMessage(content=accumulated_content, tool_calls=accumulated_tool_calls)
+        
+        if not final_ai.tool_calls:
+            return
         
         tool_call_count += 1
-        used_tool = True
-        messages.append(response)
+        messages.append(final_ai)
         
-        for tool_call in response.tool_calls:
-            fn_name = tool_call.function.name
-            args = json.loads(tool_call.function.arguments)
+        for tool_call in final_ai.tool_calls:
+            fn_name = tool_call["name"]
+            args = tool_call["args"]
             
-            logger.info(f"🔧 Tool call: {fn_name}({args})")
+            yield ("step", f"🔧 Running `{fn_name}`...")
             
             if fn_name == "web_search":
                 result = await execute_web_search(args["query"])
@@ -224,9 +250,9 @@ async def run_agent(user_message: str, user_id: str, session_id: str, history: l
             else:
                 result = "Unknown tool."
             
-            messages.append(ToolMessage(content=result, tool_call_id=tool_call.id))
+            messages.append(ToolMessage(content=result, tool_call_id=tool_call["id"]))
     
-    return "Max tool calls reached. Please rephrase."
+    yield ("chunk", "\n\n*(Max tool calls reached)*")
 
 # --- FILE INGESTION ---
 def _extract_text(file_bytes: bytes, file_name: str) -> str:
@@ -304,7 +330,7 @@ def ingest_files(files, user_id, session_id):
     collection.add(embeddings=embeddings, documents=all_chunks, metadatas=all_metadatas, ids=[str(i) for i in range(len(all_chunks))])
     return f"Ingested {len(all_chunks)} chunks."
 
-# --- MAIN ENTRY POINT ---
+# --- MAIN ENTRY POINT (STREAMING) ---
 async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="default", deep_dive=False, has_files=False):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
         yield ("answer", "Invalid user identity.")
@@ -314,15 +340,12 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
     request_id = str(uuid.uuid4())[:8]
     logger.info(f"[{request_id}] Request | {session_id} | {user_message[:50]}...")
     
-    # SECURITY: Guardrail check
     is_safe, reason = sanitize_input(user_message)
     if not is_safe:
-        logger.warning(f"[{request_id}] Blocked: {reason}")
         yield ("step", "🛡️ **Guardrail**: `BLOCKED`")
         yield ("chunk", "I cannot process that request due to safety guidelines.")
         return
     
-    # CACHE: Check semantic cache
     if not history:
         query_emb = embedding_model.encode([user_message]).tolist()
         cached = get_cached_response(query_emb)
@@ -331,23 +354,23 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
             yield ("chunk", cached)
             return
     
-    # 1. DETERMINISTIC PRE-ROUTER
     pre_route = pre_router(user_message, has_files)
     yield ("step", f"🧭 **Pre-Router**: `{pre_route.upper()}`")
     
-    # RUN AGENT
     yield ("step", "🤖 **Agent thinking...**")
     
+    full_response = ""
     try:
-        response = await run_agent(user_message, user_id, session_id, history, pre_route)
-        yield ("chunk", response)
+        async for kind, content in run_agent_stream(user_message, user_id, session_id, history, pre_route):
+            if kind == "chunk":
+                full_response += content
+            yield (kind, content)
     except Exception as e:
         logger.error(f"[{request_id}] Error: {e}")
         yield ("chunk", f"**Error:** {e}")
         return
     
-    # CACHE: Save to cache
     if not history:
         query_emb = embedding_model.encode([user_message]).tolist()
-        save_to_cache(query_emb, response)
+        save_to_cache(query_emb, full_response)
         logger.info(f"[{request_id}] Cached.")

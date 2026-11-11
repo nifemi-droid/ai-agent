@@ -1,9 +1,18 @@
 import chainlit as cl
 import asyncio
+import io
+import os
 from multi_agent import ask_agent_v2_stream, ingest_files
 from database import ensure_dbs_exist
+from faster_whisper import WhisperModel
 
 ensure_dbs_exist()
+
+# --- LOAD WHISPER MODEL (Runs locally on your Mac for free) ---
+print("Loading local Whisper model (base)...")
+# 'base' is a good balance of speed and accuracy for CPU
+whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+print("Whisper model loaded.")
 
 @cl.on_chat_start
 async def on_chat_start():
@@ -13,8 +22,7 @@ async def on_chat_start():
     
     await cl.Message(
         content="✦ **Nexus** — Your generalist AI assistant.\n\n"
-                "Ask me anything. I can search the web, answer questions about your uploaded documents, and chat.\n\n"
-                "Use the 📎 paperclip to upload a PDF, DOCX, or CSV."
+                "Ask me anything. You can type, upload files, or **click the microphone icon to speak**."
     ).send()
 
 
@@ -26,16 +34,16 @@ async def on_chat_resume(thread):
     await cl.Message(content="Resumed session.").send()
 
 
-# --- STOP CONTROL: Called when the user clicks the Stop button ---
+# --- STOP CONTROL ---
 @cl.on_stop
 async def on_stop():
-    task = cl.user_session.get("active_task")
+    task = cl.user_session.set("active_task")
     if task and not task.done():
         task.cancel()
         await cl.Message(content="⏹️ **Generation stopped.**").send()
 
 
-# --- REGENERATE: Re-runs the last prompt ---
+# --- REGENERATE ---
 @cl.action_callback("regenerate")
 async def on_regenerate(action: cl.Action):
     last_prompt = cl.user_session.get("last_prompt", "")
@@ -47,10 +55,59 @@ async def on_regenerate(action: cl.Action):
     await process_message(last_prompt, is_regenerate=True)
 
 
-# --- MAIN MESSAGE HANDLER ---
+# --- AUDIO INPUT (Speech-to-Text) ---
+@cl.on_audio_start
+async def on_audio_start():
+    # Initialize the audio buffer for this recording
+    cl.user_session.set("audio_buffer", io.BytesIO())
+    return True
+
+@cl.on_audio_chunk
+async def on_audio_chunk(chunk: cl.InputAudioChunk):
+    audio_buffer = cl.user_session.get("audio_buffer")
+    if audio_buffer is not None:
+        audio_buffer.write(chunk.data)
+
+@cl.on_audio_end
+async def on_audio_end():
+    audio_buffer = cl.user_session.get("audio_buffer")
+    if audio_buffer is None:
+        return
+    
+    # Reset buffer
+    audio_buffer.seek(0)
+    
+    # Notify user
+    msg = cl.Message(content="🎙️ **Transcribing voice...**")
+    await msg.send()
+    
+    try:
+        # Run Whisper transcription in a separate thread to not block the UI
+        segments, info = await cl.make_async(whisper_model.transcribe)(audio_buffer)
+        transcription = "".join([segment.text for segment in segments]).strip()
+        
+        if not transcription:
+            msg.content = "🎙️ *Could not hear anything. Please try again.*"
+            await msg.update()
+            return
+        
+        # Show what was heard
+        msg.content = f"🎙️ **You said:** {transcription}"
+        await msg.update()
+        
+        # Pass the transcribed text into the agent
+        cl.user_session.set("last_prompt", transcription)
+        await process_message(transcription, is_regenerate=False)
+        
+    except Exception as e:
+        msg.content = f"**Transcription error:** {e}"
+        await msg.update()
+
+
+# --- MAIN MESSAGE HANDLER (Text) ---
 @cl.on_message
 async def on_message(message: cl.Message):
-    # Handle file uploads first
+    # Handle file uploads
     if message.elements:
         files_to_ingest = []
         for element in message.elements:
@@ -79,13 +136,12 @@ async def on_message(message: cl.Message):
     await process_message(message.content, is_regenerate=False)
 
 
-# --- THE STREAMING PROCESSOR (Handles both new messages and regenerates) ---
+# --- THE STREAMING PROCESSOR ---
 async def process_message(prompt: str, is_regenerate: bool = False):
     user_id = "local"
     session_id = cl.context.session.id
     history = cl.user_session.get("history") or []
     
-    # Determine if the session has uploaded files (for pre-routing)
     has_files = False
     try:
         from multi_agent import chroma_client
@@ -95,7 +151,6 @@ async def process_message(prompt: str, is_regenerate: bool = False):
     except Exception:
         has_files = False
     
-    # Create the assistant message (this will be streamed into)
     msg = cl.Message(content="")
     await msg.send()
     
@@ -104,7 +159,6 @@ async def process_message(prompt: str, is_regenerate: bool = False):
     current_step_text = ""
     
     try:
-        # Create the async generator task so we can cancel it
         agent_gen = ask_agent_v2_stream(
             prompt, user_id, history, session_id, has_files=has_files
         )
@@ -118,13 +172,9 @@ async def process_message(prompt: str, is_regenerate: bool = False):
                 break
             
             if kind == "step":
-                # Step messages appear as short italic lines above the answer
-                if content == current_step_text:
-                    pass
-                else:
+                if content != current_step_text:
                     current_step_text = content
                     if current_step_msg is not None:
-                        # Update the existing step message in place
                         current_step_msg.content = content
                         await current_step_msg.update()
                     else:
@@ -139,7 +189,6 @@ async def process_message(prompt: str, is_regenerate: bool = False):
                 full_response = content
                 await msg.stream_token(content)
             
-            # Prep the next iteration of the generator
             active_task = asyncio.create_task(anext_wrapper(agent_gen))
             cl.user_session.set("active_task", active_task)
     
@@ -149,7 +198,6 @@ async def process_message(prompt: str, is_regenerate: bool = False):
             msg.content = full_response
             await msg.update()
         else:
-            # Keep what was generated so far
             await msg.update()
     
     except Exception as e:
@@ -160,13 +208,11 @@ async def process_message(prompt: str, is_regenerate: bool = False):
     finally:
         cl.user_session.set("active_task", None)
     
-    # Update history
     if not is_regenerate:
         history.append({"role": "user", "content": prompt})
     history.append({"role": "assistant", "content": full_response})
     cl.user_session.set("history", history)
     
-    # Add the "Regenerate" button below the response
     await cl.Message(
         content="",
         actions=[
@@ -175,7 +221,5 @@ async def process_message(prompt: str, is_regenerate: bool = False):
     ).send()
 
 
-# --- WRAPPER: Helper to make asyncio.create_task work on async generators ---
 async def anext_wrapper(gen):
-    """Wraps anext(gen) so it can be cancelled via asyncio.create_task."""
     return await gen.__anext__()
