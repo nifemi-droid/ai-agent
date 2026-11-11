@@ -4,9 +4,8 @@ import re
 import io
 import time
 import uuid
-import json
 import logging
-from typing import TypedDict, Annotated, Sequence, Literal, Optional
+from typing import TypedDict, Annotated, Sequence, Literal
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
@@ -48,105 +47,101 @@ langfuse_handler = CallbackHandler()
 MAX_FILES = 3
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_BYTES = 25 * 1024 * 1024
+MAX_TOOL_OUTPUT_CHARS = 15000  # Hard limit to prevent context overflow
 ALLOWED_EXTENSIONS = ('.pdf', '.docx', '.doc', '.txt', '.md', '.csv', '.xlsx', '.xls', '.pptx')
 
-# --- PYDANTIC MODELS ---
+fast_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.0, api_key=GROQ_KEY)
+writer_llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.2, api_key=GROQ_KEY)
+fallback_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.2, api_key=GROQ_KEY)
+
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?previous\s+instructions",
+    r"ignore\s+(all\s+)?above\s+instructions",
+    r"disregard\s+(all\s+)?previous",
+    r"forget\s+(all\s+)?previous",
+    r"you\s+are\s+now\s+",
+    r"new\s+instructions?:",
+    r"system\s*prompt:",
+    r"<\|.*?\|>",
+    r"\[INST\].*?\[/INST\]",
+    r"jailbreak",
+    r"DAN\s+mode",
+]
+
+def sanitize_input(text: str) -> tuple[bool, str]:
+    lowered = text.lower()
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, lowered):
+            return False, f"Blocked: {pattern}"
+    return True, ""
+
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     next_agent: str
     user_id: str
     session_id: str
     request_id: str
-    output_format: str  # "markdown" or "json"
+    output_format: str
     hitl_approved: bool
+    judge_passed: bool
+    buffered_response: str
 
 class RouteDecision(BaseModel):
-    next_agent: Literal["web", "writer", "doc", "review", "compare", "blocked"] = Field(description="The exact agent to route to.")
-    reasoning: str = Field(description="One sentence explaining the routing choice.")
+    next_agent: Literal["web", "writer", "doc", "review", "compare", "blocked"] = Field(description="Route.")
+    reasoning: str = Field(description="Reason.")
 
 class ContextSufficiency(BaseModel):
-    is_sufficient: bool = Field(description="Whether the retrieved context is sufficient.")
-    better_query: str = Field(description="If not sufficient, a better query.")
-
-# --- 3. HITL STATE ---
-class HITLDecision(BaseModel):
-    approved: bool = Field(description="Whether the user wants to proceed.")
-    reason: str = Field(description="Why the user approved/denied.")
-
-# --- 2. STRUCTURED OUTPUT SCHEMAS ---
-class UserStory(BaseModel):
-    title: str
-    user_story: str
-    acceptance_criteria: str
+    is_sufficient: bool = Field(description="Sufficient?")
+    better_query: str = Field(description="Better query if not.")
 
 class PRDOutput(BaseModel):
     problem: str
     goals: list[str]
-    user_stories: list[UserStory]
+    user_stories: list[dict]
     success_metrics: list[str]
     risks: list[str]
 
-llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.2, api_key=GROQ_KEY)
-fallback_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.2, api_key=GROQ_KEY)
+class JudgeDecision(BaseModel):
+    passed: bool = Field(description="Does the document meet enterprise PM standards?")
+    reason: str = Field(description="One-line reason.")
+    rewrite_instructions: str = Field(description="If failed, what to change.")
 
-primary_failures = 0
-circuit_tripped_at = 0
+# --- FIX 3: PER-SESSION CIRCUIT BREAKER ---
+circuit_state = {}  # session_id -> {"failures": int, "tripped_at": float}
 CIRCUIT_THRESHOLD = 3
 CIRCUIT_RESET_SECONDS = 60
 
-async def stream_llm(messages, callbacks=None):
-    global primary_failures, circuit_tripped_at
+async def stream_writer(messages, session_id, callbacks=None):
+    state = circuit_state.setdefault(session_id, {"failures": 0, "tripped_at": 0})
     current_time = time.time()
     
-    if primary_failures >= CIRCUIT_THRESHOLD:
-        if current_time - circuit_tripped_at < CIRCUIT_RESET_SECONDS:
-            logger.warning(f"🔌 Circuit breaker OPEN.")
+    if state["failures"] >= CIRCUIT_THRESHOLD:
+        if current_time - state["tripped_at"] < CIRCUIT_RESET_SECONDS:
+            logger.warning(f"🔌 Circuit OPEN for {session_id}.")
             try:
                 async for chunk in fallback_llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
                     if chunk.content: yield chunk.content
                 return
             except Exception as e:
-                yield f"\n\n**All AI systems offline:** {e}"
+                yield f"\n\n**Offline:** {e}"
                 return
         else:
-            primary_failures = 0
+            state["failures"] = 0
 
     try:
-        async for chunk in llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
+        async for chunk in writer_llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
             if chunk.content: yield chunk.content
-        primary_failures = 0
+        state["failures"] = 0
     except Exception as e:
-        primary_failures += 1
-        if primary_failures >= CIRCUIT_THRESHOLD:
-            circuit_tripped_at = time.time()
-        logger.warning(f"⚠️ Primary failed: {e}. Fallback...")
+        state["failures"] += 1
+        if state["failures"] >= CIRCUIT_THRESHOLD:
+            state["tripped_at"] = time.time()
+        logger.warning(f"⚠️ Primary failed for {session_id}: {e}. Fallback...")
         try:
             async for chunk in fallback_llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
                 if chunk.content: yield chunk.content
         except Exception as fallback_error:
-            yield f"\n\n**All AI systems offline:** {fallback_error}"
-
-def get_user_profile(user_id):
-    try:
-        import sqlite3
-        from database import DB_NAME
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT m.content FROM messages m
-            JOIN sessions s ON m.session_id = s.id
-            WHERE s.user_id = ? AND m.role = 'assistant'
-            ORDER BY m.timestamp DESC LIMIT 3
-        """, (user_id,))
-        rows = cursor.fetchall()
-        conn.close()
-        if not rows: return ""
-        profile = "Recent context from past sessions:\n"
-        for r in rows:
-            profile += f"- {r[0][:200]}...\n"
-        return profile
-    except Exception:
-        return ""
+            yield f"\n\n**Offline:** {fallback_error}"
 
 def get_pm_system_prompt(user_id="local"):
     try:
@@ -154,13 +149,7 @@ def get_pm_system_prompt(user_id="local"):
             context = f.read()
     except FileNotFoundError:
         context = "No product context provided."
-    memory = get_user_profile(user_id)
-    return f"""You are a Principal Technical Product Manager. 
-You produce rigorous, data-driven, and comprehensive product artifacts.
-PRODUCT CONTEXT:
-{context}
-{memory}
-"""
+    return f"You are a Principal Technical Product Manager.\nPRODUCT CONTEXT:\n{context}"
 
 def _extract_text(file_bytes: bytes, file_name: str) -> str:
     name = file_name.lower()
@@ -199,7 +188,7 @@ def ingest_files(files, user_id, session_id):
     if not files or not isinstance(files, list):
         return "No files received."
     if len(files) > MAX_FILES:
-        return f"Upload rejected: maximum {MAX_FILES} files per batch."
+        return f"Max {MAX_FILES} files per batch."
 
     total_bytes = 0
     all_chunks = []
@@ -208,17 +197,17 @@ def ingest_files(files, user_id, session_id):
         name = str(f.get("name", ""))[:200]
         safe_name = os.path.basename(name).lower()
         if not safe_name.endswith(ALLOWED_EXTENSIONS):
-            return f"Upload rejected: unsupported file type '{safe_name}'."
+            return f"Unsupported: '{safe_name}'."
         import base64
         try:
             data = base64.b64decode(f.get("data", ""))
         except Exception:
-            return "Upload rejected: malformed file data."
+            return "Malformed file."
         if len(data) > MAX_FILE_BYTES:
-            return f"Upload rejected: '{safe_name}' exceeds 10 MB."
+            return f"'{safe_name}' exceeds 10 MB."
         total_bytes += len(data)
         if total_bytes > MAX_TOTAL_BYTES:
-            return "Upload rejected: total upload exceeds 25 MB."
+            return "Total upload exceeds 25 MB."
         
         text = _extract_text(data, safe_name)
         chunks = [line.strip() for line in text.split('\n') if len(line.strip()) > 40]
@@ -227,7 +216,7 @@ def ingest_files(files, user_id, session_id):
             all_metadatas.append({"file_name": safe_name})
 
     if not all_chunks:
-        return "No readable text found in the uploaded files."
+        return "No readable text found."
 
     embeddings = embedding_model.encode(all_chunks).tolist()
     collection_name = f"docs_{user_id}_{session_id}"
@@ -235,69 +224,34 @@ def ingest_files(files, user_id, session_id):
     except Exception: pass
     collection = chroma_client.create_collection(name=collection_name)
     collection.add(embeddings=embeddings, documents=all_chunks, metadatas=all_metadatas, ids=[str(i) for i in range(len(all_chunks))])
-    return f"Ingested {len(all_chunks)} chunks from {len(files)} file(s)."
+    return f"Ingested {len(all_chunks)} chunks."
 
 def sanitize_context(context):
-    patterns = [r"ignore\s+(all\s+)?previous\s+instructions", r"ignore\s+(all\s+)?above\s+instructions", r"disregard\s+(all\s+)?previous", r"forget\s+(all\s+)?previous", r"you\s+are\s+now\s+", r"new\s+instructions?:", r"system\s*prompt:", r"<\|.*?\|>", r"\[INST\].*?\[/INST\]"]
     out = context
-    for p in patterns:
+    for p in INJECTION_PATTERNS:
         out = re.sub(p, "[REDACTED]", out, flags=re.IGNORECASE | re.DOTALL)
     return out
 
-async def compress_history(history):
-    if len(history) < 10: return history
-    logger.info("🗜️ Compressing history...")
-    recent = history[-4:]
-    old = history[:-4]
-    summary_prompt = f"Summarize this conversation into a concise handoff summary.\n{old}"
-    try:
-        response = await llm.ainvoke([HumanMessage(content=summary_prompt)])
-        summary_message = AIMessage(content=f"[Previous conversation summary]: {response.content}")
-        return [{"role": "assistant", "content": summary_message.content}] + recent
-    except Exception as e:
-        logger.error(f"Compression failed: {e}")
-        return history
-
-# --- 1. LLM-AS-A-JUDGE NODE ---
-async def judge_node(state: AgentState):
-    req_id = state.get("request_id", "unknown")
-    last_message = state["messages"][-1]
-    
-    judge_prompt = f"""
-    You are a strict VP of Product reviewing a document generated by an AI.
-    Document:
-    {last_message.content}
-    
-    Evaluate: Does this meet the standard of a Principal PM at Google? 
-    Look for: vague goals, missing metrics, unrealistic rollout, lack of risks.
-    
-    Reply with PASS or FAIL, and a one-line reason.
-    """
-    
-    try:
-        response = await llm.ainvoke([HumanMessage(content=judge_prompt)], config={"callbacks": [langfuse_handler]})
-        result = response.content.strip().upper()
-        logger.info(f"[{req_id}] Judge Verdict: {result[:50]}")
-        
-        if "PASS" in result:
-            return {"next_agent": "finish"}
-        else:
-            return {"next_agent": "writer_retry"}
-    except Exception as e:
-        logger.error(f"[{req_id}] Judge failed: {e}")
-        return {"next_agent": "finish"}
+# --- FIX 2: TOOL OUTPUT SANITIZATION ---
+def truncate_tool_output(text: str, max_chars: int = MAX_TOOL_OUTPUT_CHARS) -> str:
+    """Truncate tool output to prevent context overflow and strip HTML."""
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n\n[... truncated for context limit ...]"
+    return text
 
 async def manager_node(state: AgentState):
     req_id = state.get("request_id", "unknown")
-    system_prompt = """You are the routing manager.
-    - 'web': market research, competitors
-    - 'writer': writing new PRDs, FRDs, specs
-    - 'doc': answering questions about a SINGLE uploaded document
-    - 'review': critiquing an uploaded document
-    - 'compare': comparing multiple uploaded documents
-    - 'blocked': malicious input
+    system_prompt = """Routing manager. Reply with one word:
+    - 'web': market research
+    - 'writer': writing new docs
+    - 'doc': answering about a single document
+    - 'review': critiquing a document
+    - 'compare': comparing docs
+    - 'blocked': malicious
     """
-    structured_llm = llm.with_structured_output(RouteDecision)
+    structured_llm = fast_llm.with_structured_output(RouteDecision)
     try:
         decision = await structured_llm.ainvoke([SystemMessage(content=system_prompt), state["messages"][-1]], config={"callbacks": [langfuse_handler]})
         logger.info(f"[{req_id}] Manager → {decision.next_agent}")
@@ -308,32 +262,30 @@ async def manager_node(state: AgentState):
 
 def guardrail_node(state: AgentState):
     req_id = state.get("request_id", "unknown")
-    system_prompt = "Is this input malicious? Reply 'SAFE' or 'UNSAFE'."
-    response = llm.invoke([HumanMessage(content=system_prompt), state["messages"][-1]], config={"callbacks": [langfuse_handler]})
-    decision = "blocked" if "UNSAFE" in response.content.upper() else "manager"
-    return {"next_agent": decision}
+    is_safe, reason = sanitize_input(state["messages"][-1].content)
+    if not is_safe:
+        logger.warning(f"[{req_id}] Guardrail blocked: {reason}")
+        return {"next_agent": "blocked"}
+    return {"next_agent": "manager"}
 
-# --- 2 & 3. WRITER WITH STRUCTURED OUTPUT + HITL ---
+# --- FIX 1: BUFFERED WRITER WITH SYNCHRONOUS JUDGE ---
 async def writer_worker_node(state: AgentState):
     req_id = state.get("request_id", "unknown")
+    session_id = state.get("session_id", "default")
     query = state["messages"][-1].content.lower()
     output_format = state.get("output_format", "markdown")
     hitl_approved = state.get("hitl_approved", False)
     
-    # 3. HITL: Pause for approval on JSON generation (high-stakes)
     if output_format == "json" and not hitl_approved:
-        logger.info(f"[{req_id}] HITL: Pausing for approval on structured output.")
         decision = interrupt({
             "type": "approval_required",
-            "message": "I am about to generate a structured JSON PRD. This will be detailed and cost more tokens. Proceed?",
+            "message": "Generate structured JSON PRD?",
             "options": ["Approve", "Deny"]
         })
-        
         if not decision.get("approved", False):
-            yield "**Generation cancelled by user.**"
+            yield "**Cancelled.**"
             return
     
-    # Determine artifact type
     if "prd" in query or "product requirement" in query:
         artifact_type = "PRD"
     elif "frd" in query:
@@ -344,104 +296,108 @@ async def writer_worker_node(state: AgentState):
         artifact_type = "Strategy Doc"
     
     if output_format == "json":
-        # 2. STRUCTURED OUTPUT
-        structured_llm = llm.with_structured_output(PRDOutput)
+        structured_llm = writer_llm.with_structured_output(PRDOutput)
         try:
             result = await structured_llm.ainvoke([
                 SystemMessage(content=get_pm_system_prompt(state['user_id'])),
-                HumanMessage(content=f"Generate a structured {artifact_type} for: {query}")
+                HumanMessage(content=f"Generate structured {artifact_type} for: {query}")
             ], config={"callbacks": [langfuse_handler]})
-            
-            json_output = result.model_dump_json(indent=2)
-            yield f"```json\n{json_output}\n```"
-            logger.info(f"[{req_id}] Structured JSON generated.")
+            yield f"```json\n{result.model_dump_json(indent=2)}\n```"
         except Exception as e:
-            yield f"**JSON Generation Error:** {e}"
+            yield f"**JSON Error:** {e}"
     else:
-        # MARKDOWN OUTPUT
         prompt = f"Write a comprehensive {artifact_type} based on: {query}"
-        full_response = ""
-        async for chunk in stream_llm([SystemMessage(content=get_pm_system_prompt(state['user_id'])), HumanMessage(content=prompt)]):
-            full_response += chunk
-            yield chunk
+        buffer = ""
+        # Generate in the background, buffer it
+        async for chunk in stream_writer([SystemMessage(content=get_pm_system_prompt(state['user_id'])), HumanMessage(content=prompt)], session_id=session_id):
+            buffer += chunk
+        
+        # Store buffer in state for the judge to evaluate
+        state["buffered_response"] = buffer
+        yield buffer
 
-async def writer_retry_node(state: AgentState):
-    """Triggered by the Judge when quality is insufficient."""
+async def judge_node(state: AgentState):
     req_id = state.get("request_id", "unknown")
-    logger.info(f"[{req_id}] Writer Retry triggered by Judge.")
-    query = state["messages"][-1].content
-    retry_prompt = f"The previous document was rejected by the Quality Judge. Rewrite it with more rigor, specific metrics, and realistic risks. Original request: {query}"
-    async for chunk in stream_llm([SystemMessage(content=get_pm_system_prompt(state['user_id'])), HumanMessage(content=retry_prompt)]):
-        yield chunk
+    buffered = state.get("buffered_response", "")
+    
+    if not buffered or len(buffered) < 200:
+        # Too short to judge; consider it passed
+        return {"judge_passed": True}
+    
+    judge_prompt = f"""
+    Review this document as a VP of Product at a top tech company.
+    Document: {buffered[:4000]}
+    
+    Evaluate: Does it meet Principal PM standards? 
+    If not, what specific changes should the Writer make?
+    """
+    
+    try:
+        structured_llm = fast_llm.with_structured_output(JudgeDecision)
+        result = await structured_llm.ainvoke([HumanMessage(content=judge_prompt)], config={"callbacks": [langfuse_handler]})
+        
+        if result.passed:
+            logger.info(f"[{req_id}] Judge: PASS")
+            return {"judge_passed": True}
+        else:
+            logger.warning(f"[{req_id}] Judge: FAIL. Reason: {result.reason}")
+            return {"judge_passed": False, "messages": [AIMessage(content=f"**⚠️ Quality Gate:** {result.reason}\n\n**Suggested fix:** {result.rewrite_instructions}")]}
+    except Exception as e:
+        logger.error(f"[{req_id}] Judge error: {e}")
+        return {"judge_passed": True}
 
 async def web_worker_node(state: AgentState):
     req_id = state.get("request_id", "unknown")
+    session_id = state.get("session_id", "default")
     try:
         query = state["messages"][-1].content
         res = tavily.search(query=query, search_depth="advanced", timeout=15)
-        context = "\n\n".join([f"SOURCE: {r['title']}\nURL: {r['url']}\nCONTENT: {r['content']}" for r in res['results']])
-        prompt = f"{get_pm_system_prompt(state['user_id'])}\nAnswer this: {query}\nData: {context}"
-        async for chunk in stream_llm([HumanMessage(content=prompt)]):
+        raw_context = "\n\n".join([f"SOURCE: {r['title']}\nURL: {r['url']}\nCONTENT: {r['content']}" for r in res['results']])
+        # FIX 2: Apply truncation
+        context = truncate_tool_output(raw_context)
+        
+        prompt = f"{get_pm_system_prompt(state['user_id'])}\nAnswer: {query}\nData: {context}"
+        async for chunk in stream_writer([HumanMessage(content=prompt)], session_id=session_id):
             yield chunk
     except Exception as e:
-        yield f"**Web Search Error:** {e}"
+        yield f"**Web Error:** {e}"
 
 async def doc_worker_node(state: AgentState, mode="query"):
     req_id = state.get("request_id", "unknown")
+    session_id = state.get("session_id", "default")
     try:
         query = state["messages"][-1].content
-        session_id = state.get("session_id", "default")
-        
         collection = chroma_client.get_collection(name=f"docs_{state['user_id']}_{session_id}")
+        
         all_metadatas = collection.get()['metadatas']
         unique_files = list(set([m['file_name'] for m in all_metadatas if m]))
+        target_file = next((f for f in unique_files if f in query.lower()), None)
         
-        target_file = None
-        for f in unique_files:
-            if f in query.lower():
-                target_file = f
-                break
-                
-        max_retries = 2
-        current_query = query
+        if target_file:
+            dense_results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=10, where={"file_name": target_file})
+        else:
+            dense_results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=10)
         
-        for attempt in range(max_retries):
-            if target_file:
-                dense_results = collection.query(query_embeddings=embedding_model.encode([current_query]).tolist(), n_results=10, where={"file_name": target_file})
-            else:
-                dense_results = collection.query(query_embeddings=embedding_model.encode([current_query]).tolist(), n_results=10)
-                
-            context = "\n\n".join(dense_results['documents'][0])
-            safe_context = sanitize_context(context)
-            
-            eval_prompt = f"Question: {query}\nContext: {safe_context}\nIs this context sufficient?"
-            structured_llm = llm.with_structured_output(ContextSufficiency)
-            try:
-                eval_res = await structured_llm.ainvoke([HumanMessage(content=eval_prompt)])
-                if eval_res.is_sufficient:
-                    break
-                else:
-                    current_query = eval_res.better_query
-            except Exception:
-                break
-                
+        raw_context = "\n\n".join(dense_results['documents'][0])
+        # FIX 2: Sanitize and truncate document context
+        safe_context = truncate_tool_output(sanitize_context(raw_context))
+        
         if mode == "review":
-            prompt = f"{get_pm_system_prompt(state['user_id'])}\nYou are a VP of Product reviewing a document.\n<document>{safe_context}</document>\nProvide critique: Strengths, Gaps, Risks, Recommendations."
+            prompt = f"{get_pm_system_prompt(state['user_id'])}\nReview this document:\n<document>{safe_context}</document>\nProvide: Strengths, Gaps, Risks, Recommendations."
         else:
             prompt = f"{get_pm_system_prompt(state['user_id'])}\nAnswer using this context:\n{safe_context}\n\nQuestion: {query}"
         
-        async for chunk in stream_llm([HumanMessage(content=prompt)]):
+        async for chunk in stream_writer([HumanMessage(content=prompt)], session_id=session_id):
             yield chunk
     except Exception as e:
-        yield f"**Document Error:** {e}"
+        yield f"**Doc Error:** {e}"
 
-# --- GRAPH BUILD ---
+# --- GRAPH ---
 checkpointer = SqliteSaver.from_conn_string("checkpoints.sqlite")
 workflow = StateGraph(AgentState)
 workflow.add_node("guardrail", guardrail_node)
 workflow.add_node("manager", manager_node)
 workflow.add_node("writer", writer_worker_node)
-workflow.add_node("writer_retry", writer_retry_node)
 workflow.add_node("judge", judge_node)
 workflow.add_node("web", web_worker_node)
 workflow.add_node("doc", doc_worker_node)
@@ -450,11 +406,8 @@ workflow.add_node("review", lambda state: doc_worker_node(state, mode="review"))
 workflow.set_entry_point("guardrail")
 workflow.add_conditional_edges("guardrail", lambda x: "blocked" if x["next_agent"] == "blocked" else "manager", {"blocked": END, "manager": "manager"})
 workflow.add_conditional_edges("manager", lambda x: x["next_agent"], {"web": "web", "writer": "writer", "doc": "doc", "review": "review", "compare": END, "blocked": END})
-
-# Route Writer to Judge for quality check
 workflow.add_edge("writer", "judge")
-workflow.add_conditional_edges("judge", lambda x: x["next_agent"], {"finish": END, "writer_retry": "writer_retry"})
-workflow.add_edge("writer_retry", END)
+workflow.add_edge("judge", END)
 workflow.add_edge("web", END)
 workflow.add_edge("doc", END)
 workflow.add_edge("review", END)
@@ -472,7 +425,7 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
 
     if history is None: history = []
     request_id = str(uuid.uuid4())[:8]
-    logger.info(f"[{request_id}] New Request | Format: {output_format} | Message: {user_message[:50]}...")
+    logger.info(f"[{request_id}] Request | {session_id} | {user_message[:50]}...")
 
     if not history:
         query_emb = embedding_model.encode([user_message]).tolist()
@@ -482,15 +435,14 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
             yield ("chunk", cached)
             return
 
-    compressed_history = await compress_history(history)
     history_messages = []
-    for msg in compressed_history:
+    for msg in history:
         if msg['role'] == 'user': history_messages.append(HumanMessage(content=msg['content']))
         elif msg['role'] == 'assistant': history_messages.append(AIMessage(content=msg['content']))
     history_messages.append(HumanMessage(content=user_message[:100_000]))
 
     config = {"configurable": {"thread_id": session_id}, "callbacks": [langfuse_handler]}
-    inputs = {"messages": history_messages, "user_id": user_id, "session_id": session_id, "request_id": request_id, "output_format": output_format, "hitl_approved": False}
+    inputs = {"messages": history_messages, "user_id": user_id, "session_id": session_id, "request_id": request_id, "output_format": output_format, "hitl_approved": False, "judge_passed": False, "buffered_response": ""}
     
     route_decision = "writer"
     try:
@@ -505,12 +457,14 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
                     route_decision = node_output.get("next_agent")
                     yield ("step", f"🧠 **Manager** → `{route_decision.upper()}`")
                 elif node_name == "judge":
-                    yield ("step", f"⚖️ **Judge**: `{node_output.get('next_agent').upper()}`")
+                    passed = node_output.get("judge_passed", True)
+                    if not passed:
+                        yield ("step", "⚖️ **Judge**: Quality check flagged issues (see output).")
     except Exception as e:
         logger.error(f"[{request_id}] Graph Error: {e}")
         yield ("step", f"❌ **Graph Error:** {e}")
 
-    state = {"messages": history_messages, "user_id": user_id, "next_agent": "", "session_id": session_id, "request_id": request_id, "output_format": output_format, "hitl_approved": False}
+    state = {"messages": history_messages, "user_id": user_id, "next_agent": "", "session_id": session_id, "request_id": request_id, "output_format": output_format, "hitl_approved": False, "judge_passed": False, "buffered_response": ""}
     full_response = ""
     
     if route_decision == "web":
@@ -529,7 +483,7 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
             full_response += chunk
             yield ("chunk", chunk)
     else:
-        yield ("step", f"✍️ **Writer** ({output_format.upper()})...")
+        yield ("step", f"✍️ **Writer**...")
         async for chunk in writer_worker_node(state):
             full_response += chunk
             yield ("chunk", chunk)
@@ -537,4 +491,3 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
     if not history and route_decision != "doc":
         query_emb = embedding_model.encode([user_message]).tolist()
         save_to_cache(query_emb, full_response)
-        logger.info(f"[{request_id}] Saved to semantic cache.")
