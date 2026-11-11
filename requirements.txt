@@ -13,3 +13,6 @@ openpyxl
 python-docx
 python-pptx
 markdown
+faster-whisper
+mxbai-rerank
+tavily-python
