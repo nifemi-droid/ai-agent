@@ -4,14 +4,13 @@ import re
 import io
 import time
 import uuid
+import json
 import logging
 from typing import TypedDict, Annotated, Sequence, Literal
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 import operator
 from tavily import TavilyClient
 from rank_bm25 import BM25Okapi
@@ -46,13 +45,15 @@ langfuse_handler = CallbackHandler()
 MAX_FILES = 3
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_TOTAL_BYTES = 25 * 1024 * 1024
-MAX_TOOL_OUTPUT_CHARS = 15000
+MAX_TOOL_OUTPUT_CHARS = 8000
+MAX_CONTEXT_TOKENS = 6000
 ALLOWED_EXTENSIONS = ('.pdf', '.docx', '.doc', '.txt', '.md', '.csv', '.xlsx', '.xls', '.pptx')
 
 fast_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.0, api_key=GROQ_KEY)
 main_llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, api_key=GROQ_KEY)
 fallback_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.3, api_key=GROQ_KEY)
 
+# --- SECURITY: INJECTION BLOCKLIST ---
 INJECTION_PATTERNS = [
     r"ignore\s+(all\s+)?previous\s+instructions",
     r"ignore\s+(all\s+)?above\s+instructions",
@@ -74,57 +75,160 @@ def sanitize_input(text: str) -> tuple[bool, str]:
             return False, f"Blocked: {pattern}"
     return True, ""
 
-class AgentState(TypedDict):
-    messages: Annotated[Sequence[BaseMessage], operator.add]
-    next_agent: str
-    user_id: str
-    session_id: str
-    request_id: str
-
-class RouteDecision(BaseModel):
-    next_agent: Literal["web", "doc", "review", "compare", "general", "blocked"] = Field(description="Route.")
-    reasoning: str = Field(description="Reason.")
-
-circuit_state = {}
-CIRCUIT_THRESHOLD = 3
-CIRCUIT_RESET_SECONDS = 60
-
-async def stream_llm(messages, session_id, callbacks=None):
-    state = circuit_state.setdefault(session_id, {"failures": 0, "tripped_at": 0})
-    current_time = time.time()
+# --- 1. DETERMINISTIC PRE-ROUTER ---
+def pre_router(message: str, has_files: bool) -> str:
+    """Route deterministically before the LLM is even called."""
+    msg = message.lower().strip()
     
-    if state["failures"] >= CIRCUIT_THRESHOLD:
-        if current_time - state["tripped_at"] < CIRCUIT_RESET_SECONDS:
-            try:
-                async for chunk in fallback_llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
-                    if chunk.content: yield chunk.content
-                return
-            except Exception as e:
-                yield f"\n\n**Offline:** {e}"
-                return
-        else:
-            state["failures"] = 0
+    if msg.startswith("/web") or "search the web" in msg or "latest news" in msg:
+        return "web"
+    if has_files:
+        return "doc"
+    if msg.startswith("/doc") or "uploaded document" in msg:
+        return "doc"
+    
+    return "auto"
 
+# --- 2. NATIVE TOOL SCHEMAS ---
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for real-time information, market research, competitors, or news.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_documents",
+            "description": "Search the user's uploaded documents for relevant information.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query"},
+                    "file_name": {"type": "string", "description": "Optional: specific file to search"}
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+# --- TOOL EXECUTORS ---
+async def execute_web_search(query: str) -> str:
     try:
-        async for chunk in main_llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
-            if chunk.content: yield chunk.content
-        state["failures"] = 0
+        res = tavily.search(query=query, search_depth="advanced", timeout=15)
+        raw = "\n\n".join([f"SOURCE: {r['title']}\nURL: {r['url']}\nCONTENT: {r['content']}" for r in res['results']])
+        return re.sub(r'<[^>]+>', '', raw)[:MAX_TOOL_OUTPUT_CHARS]
     except Exception as e:
-        state["failures"] += 1
-        if state["failures"] >= CIRCUIT_THRESHOLD:
-            state["tripped_at"] = time.time()
+        return f"Web search failed: {e}"
+
+def execute_search_documents(query: str, user_id: str, session_id: str, file_name: str = None) -> str:
+    try:
+        collection = chroma_client.get_collection(name=f"docs_{user_id}_{session_id}")
+        if file_name:
+            results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=10, where={"file_name": file_name})
+        else:
+            results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=10)
+        return "\n\n".join(results['documents'][0])[:MAX_TOOL_OUTPUT_CHARS]
+    except Exception as e:
+        return f"Document search failed: {e}"
+
+# --- 3. TOKEN-BOUNDED CONTEXT ---
+def estimate_tokens(text: str) -> int:
+    """Rough estimate: 1 token ≈ 4 characters."""
+    return len(text) // 4
+
+def compress_history(history: list, max_tokens: int = MAX_CONTEXT_TOKENS) -> list:
+    """Drop oldest messages until under the token limit."""
+    total_tokens = sum(estimate_tokens(m['content']) for m in history)
+    
+    if total_tokens <= max_tokens:
+        return history
+    
+    logger.info(f"🗜️ Context too large ({total_tokens} tokens). Compressing...")
+    # Keep the most recent messages, drop from the front
+    compressed = history[:]
+    while estimate_tokens_compressed(compressed) > max_tokens and len(compressed) > 2:
+        compressed.pop(0)
+    
+    return compressed
+
+def estimate_tokens_compressed(history: list) -> int:
+    return sum(estimate_tokens(m['content']) for m in history)
+
+# --- AGENT LOOP WITH NATIVE TOOL CALLING ---
+async def run_agent(user_message: str, user_id: str, session_id: str, history: list, pre_route: str = "auto") -> str:
+    # 3. COMPRESS HISTORY BEFORE SENDING
+    compressed_history = compress_history(history)
+    
+    messages = [
+        SystemMessage(content="""You are a helpful, intelligent AI assistant.
+        Use the provided tools when needed:
+        - web_search: for real-time info, news, or competitors
+        - search_documents: for questions about the user's uploaded files
+        
+        Answer directly when no tools are needed. Be concise but thorough. Use markdown formatting.""")
+    ]
+    
+    for msg in compressed_history[-10:]:
+        messages.append(HumanMessage(content=msg['content']) if msg['role'] == 'user' else AIMessage(content=msg['content']))
+    
+    messages.append(HumanMessage(content=user_message))
+    
+    max_tool_calls = 3
+    tool_call_count = 0
+    used_tool = False
+    
+    while tool_call_count < max_tool_calls:
         try:
-            async for chunk in fallback_llm.astream(messages, config={"callbacks": callbacks or [langfuse_handler]}):
-                if chunk.content: yield chunk.content
-        except Exception as fallback_error:
-            yield f"\n\n**Offline:** {fallback_error}"
+            # 1. PRE-ROUTER: If deterministic route, force tool on first call
+            if tool_call_count == 0 and pre_route == "web":
+                response = await main_llm.ainvoke(messages, tools=[tools[0]], tool_choice={"type": "function", "function": {"name": "web_search"}}, config={"callbacks": [langfuse_handler]})
+            elif tool_call_count == 0 and pre_route == "doc":
+                response = await main_llm.ainvoke(messages, tools=[tools[1]], tool_choice={"type": "function", "function": {"name": "search_documents"}}, config={"callbacks": [langfuse_handler]})
+            else:
+                response = await main_llm.ainvoke(messages, tools=tools, config={"callbacks": [langfuse_handler]})
+        except Exception as e:
+            logger.error(f"LLM error: {e}. Trying fallback...")
+            try:
+                response = await fallback_llm.ainvoke(messages, tools=tools, config={"callbacks": [langfuse_handler]})
+            except Exception as fallback_error:
+                return f"**AI systems offline:** {fallback_error}"
+        
+        if not response.tool_calls:
+            return response.content
+        
+        tool_call_count += 1
+        used_tool = True
+        messages.append(response)
+        
+        for tool_call in response.tool_calls:
+            fn_name = tool_call.function.name
+            args = json.loads(tool_call.function.arguments)
+            
+            logger.info(f"🔧 Tool call: {fn_name}({args})")
+            
+            if fn_name == "web_search":
+                result = await execute_web_search(args["query"])
+            elif fn_name == "search_documents":
+                result = execute_search_documents(args["query"], user_id, session_id, args.get("file_name"))
+            else:
+                result = "Unknown tool."
+            
+            messages.append(ToolMessage(content=result, tool_call_id=tool_call.id))
+    
+    return "Max tool calls reached. Please rephrase."
 
-def get_general_system_prompt():
-    return """You are a highly capable, helpful, and intelligent AI assistant.
-    Answer the user's questions directly, accurately, and comprehensively.
-    Use markdown formatting for readability. Be concise but thorough.
-    If asked to write a document, write it in clean markdown."""
-
+# --- FILE INGESTION ---
 def _extract_text(file_bytes: bytes, file_name: str) -> str:
     name = file_name.lower()
     try:
@@ -200,140 +304,25 @@ def ingest_files(files, user_id, session_id):
     collection.add(embeddings=embeddings, documents=all_chunks, metadatas=all_metadatas, ids=[str(i) for i in range(len(all_chunks))])
     return f"Ingested {len(all_chunks)} chunks."
 
-def sanitize_context(context):
-    out = context
-    for p in INJECTION_PATTERNS:
-        out = re.sub(p, "[REDACTED]", out, flags=re.IGNORECASE | re.DOTALL)
-    return out
-
-def truncate_tool_output(text: str, max_chars: int = MAX_TOOL_OUTPUT_CHARS) -> str:
-    text = re.sub(r'<[^>]+>', '', text)
-    if len(text) > max_chars:
-        text = text[:max_chars] + "\n\n[... truncated ...]"
-    return text
-
-async def manager_node(state: AgentState):
-    req_id = state.get("request_id", "unknown")
-    system_prompt = """Routing manager. Reply with one word:
-    - 'web': market research, real-time info, competitors, news
-    - 'doc': answering about an uploaded document
-    - 'review': critiquing an uploaded document
-    - 'compare': comparing multiple uploaded documents
-    - 'general': simple questions, casual chat, coding help, writing tasks, general knowledge
-    - 'blocked': malicious
-    """
-    structured_llm = fast_llm.with_structured_output(RouteDecision)
-    try:
-        decision = await structured_llm.ainvoke([SystemMessage(content=system_prompt), state["messages"][-1]], config={"callbacks": [langfuse_handler]})
-        logger.info(f"[{req_id}] Manager → {decision.next_agent}")
-        return {"next_agent": decision.next_agent}
-    except Exception as e:
-        logger.error(f"[{req_id}] Manager failed: {e}")
-        return {"next_agent": "general"}
-
-def guardrail_node(state: AgentState):
-    req_id = state.get("request_id", "unknown")
-    is_safe, reason = sanitize_input(state["messages"][-1].content)
-    if not is_safe:
-        logger.warning(f"[{req_id}] Guardrail blocked: {reason}")
-        return {"next_agent": "blocked"}
-    return {"next_agent": "manager"}
-
-async def general_worker_node(state: AgentState):
-    req_id = state.get("request_id", "unknown")
-    session_id = state.get("session_id", "default")
-    messages = state["messages"][-10:]
-    
-    conversation = [SystemMessage(content=get_general_system_prompt())]
-    for msg in messages:
-        conversation.append(msg)
-    
-    logger.info(f"[{req_id}] General Worker answering.")
-    async for chunk in stream_llm(conversation, session_id=session_id):
-        yield chunk
-
-async def web_worker_node(state: AgentState):
-    req_id = state.get("request_id", "unknown")
-    session_id = state.get("session_id", "default")
-    try:
-        query = state["messages"][-1].content
-        res = tavily.search(query=query, search_depth="advanced", timeout=15)
-        raw_context = "\n\n".join([f"SOURCE: {r['title']}\nURL: {r['url']}\nCONTENT: {r['content']}" for r in res['results']])
-        context = truncate_tool_output(raw_context)
-        
-        prompt = f"{get_general_system_prompt()}\n\nUser Question: {query}\n\nWeb Research Data:\n{context}\n\nAnswer based on this data."
-        async for chunk in stream_llm([HumanMessage(content=prompt)], session_id=session_id):
-            yield chunk
-    except Exception as e:
-        yield f"**Web Error:** {e}"
-
-async def doc_worker_node(state: AgentState, mode="query"):
-    req_id = state.get("request_id", "unknown")
-    session_id = state.get("session_id", "default")
-    try:
-        query = state["messages"][-1].content
-        collection = chroma_client.get_collection(name=f"docs_{state['user_id']}_{session_id}")
-        
-        all_metadatas = collection.get()['metadatas']
-        unique_files = list(set([m['file_name'] for m in all_metadatas if m]))
-        target_file = next((f for f in unique_files if f in query.lower()), None)
-        
-        if target_file:
-            dense_results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=10, where={"file_name": target_file})
-        else:
-            dense_results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=10)
-        
-        raw_context = "\n\n".join(dense_results['documents'][0])
-        safe_context = truncate_tool_output(sanitize_context(raw_context))
-        
-        if mode == "review":
-            prompt = f"{get_general_system_prompt()}\n\nReview this document:\n<document>{safe_context}</document>\nProvide: Strengths, Gaps, Risks, Recommendations."
-        else:
-            prompt = f"{get_general_system_prompt()}\n\nAnswer using this context:\n{safe_context}\n\nQuestion: {query}"
-        
-        async for chunk in stream_llm([HumanMessage(content=prompt)], session_id=session_id):
-            yield chunk
-    except Exception as e:
-        yield f"**Doc Error:** {e}"
-
-checkpointer = SqliteSaver.from_conn_string("checkpoints.sqlite")
-workflow = StateGraph(AgentState)
-workflow.add_node("guardrail", guardrail_node)
-workflow.add_node("manager", manager_node)
-workflow.add_node("web", web_worker_node)
-workflow.add_node("doc", doc_worker_node)
-workflow.add_node("review", lambda state: doc_worker_node(state, mode="review"))
-workflow.add_node("general", general_worker_node)
-
-workflow.set_entry_point("guardrail")
-workflow.add_conditional_edges("guardrail", lambda x: "blocked" if x["next_agent"] == "blocked" else "manager", {"blocked": END, "manager": "manager"})
-workflow.add_conditional_edges("manager", lambda x: x["next_agent"], {
-    "web": "web", 
-    "doc": "doc", 
-    "review": "review", 
-    "compare": END, 
-    "general": "general",
-    "blocked": END
-})
-workflow.add_edge("web", END)
-workflow.add_edge("doc", END)
-workflow.add_edge("review", END)
-workflow.add_edge("general", END)
-
-multi_agent_app = workflow.compile(checkpointer=checkpointer)
-
-async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="default", deep_dive=False):
+# --- MAIN ENTRY POINT ---
+async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="default", deep_dive=False, has_files=False):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
         yield ("answer", "Invalid user identity.")
         return
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
-        yield ("answer", "Invalid session.")
-        return
-
+    
     if history is None: history = []
     request_id = str(uuid.uuid4())[:8]
     logger.info(f"[{request_id}] Request | {session_id} | {user_message[:50]}...")
-
+    
+    # SECURITY: Guardrail check
+    is_safe, reason = sanitize_input(user_message)
+    if not is_safe:
+        logger.warning(f"[{request_id}] Blocked: {reason}")
+        yield ("step", "🛡️ **Guardrail**: `BLOCKED`")
+        yield ("chunk", "I cannot process that request due to safety guidelines.")
+        return
+    
+    # CACHE: Check semantic cache
     if not history:
         query_emb = embedding_model.encode([user_message]).tolist()
         cached = get_cached_response(query_emb)
@@ -341,57 +330,24 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
             yield ("step", "⚡ **Cache Hit**...")
             yield ("chunk", cached)
             return
-
-    history_messages = []
-    for msg in history:
-        if msg['role'] == 'user': history_messages.append(HumanMessage(content=msg['content']))
-        elif msg['role'] == 'assistant': history_messages.append(AIMessage(content=msg['content']))
-    history_messages.append(HumanMessage(content=user_message[:100_000]))
-
-    config = {"configurable": {"thread_id": session_id}, "callbacks": [langfuse_handler]}
-    inputs = {"messages": history_messages, "user_id": user_id, "session_id": session_id, "request_id": request_id}
     
-    route_decision = "general"
+    # 1. DETERMINISTIC PRE-ROUTER
+    pre_route = pre_router(user_message, has_files)
+    yield ("step", f"🧭 **Pre-Router**: `{pre_route.upper()}`")
+    
+    # RUN AGENT
+    yield ("step", "🤖 **Agent thinking...**")
+    
     try:
-        for event in multi_agent_app.stream(inputs, config, stream_mode="updates"):
-            for node_name, node_output in event.items():
-                if node_name == "guardrail":
-                    if node_output.get("next_agent") == "blocked":
-                        yield ("step", "🛡️ **Guardrail**: `BLOCKED`")
-                        yield ("answer", "I cannot process that request.")
-                        return
-                elif node_name == "manager":
-                    route_decision = node_output.get("next_agent")
-                    yield ("step", f"🧠 **Manager** → `{route_decision.upper()}`")
+        response = await run_agent(user_message, user_id, session_id, history, pre_route)
+        yield ("chunk", response)
     except Exception as e:
-        logger.error(f"[{request_id}] Graph Error: {e}")
-        yield ("step", f"❌ **Graph Error:** {e}")
-
-    state = {"messages": history_messages, "user_id": user_id, "next_agent": "", "session_id": session_id, "request_id": request_id}
-    full_response = ""
+        logger.error(f"[{request_id}] Error: {e}")
+        yield ("chunk", f"**Error:** {e}")
+        return
     
-    if route_decision == "web":
-        yield ("step", "🌐 **Web Worker**...")
-        async for chunk in web_worker_node(state):
-            full_response += chunk
-            yield ("chunk", chunk)
-    elif route_decision == "doc":
-        yield ("step", "📄 **Doc Worker**...")
-        async for chunk in doc_worker_node(state):
-            full_response += chunk
-            yield ("chunk", chunk)
-    elif route_decision == "review":
-        yield ("step", "🔍 **Critique Mode**...")
-        async for chunk in doc_worker_node(state, mode="review"):
-            full_response += chunk
-            yield ("chunk", chunk)
-    else:
-        yield ("step", "💬 **General Chat**...")
-        async for chunk in general_worker_node(state):
-            full_response += chunk
-            yield ("chunk", chunk)
-        
-    if not history and route_decision != "doc":
+    # CACHE: Save to cache
+    if not history:
         query_emb = embedding_model.encode([user_message]).tolist()
-        save_to_cache(query_emb, full_response)
+        save_to_cache(query_emb, response)
         logger.info(f"[{request_id}] Cached.")
