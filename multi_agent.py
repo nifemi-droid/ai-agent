@@ -12,8 +12,9 @@ from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 import operator
-from tavily import TavilyClient
+import requests
 from mxbai_rerank import MxbaiRerankV2
+from tavily import TavilyClient
 
 from langfuse.langchain import CallbackHandler
 from pypdf import PdfReader
@@ -38,8 +39,7 @@ print("Loading embedding model...")
 os.environ["HF_HUB_OFFLINE"] = "1"
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-print("Loading reranker model (mxbai-rerank-base-v2)...")
-# Initialize the reranker once at startup. It runs locally on CPU for free.
+print("Loading reranker model...")
 reranker = MxbaiRerankV2("mixedbread-ai/mxbai-rerank-base-v2")
 
 print("Connecting to ChromaDB...")
@@ -58,7 +58,6 @@ fast_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.0, api_key=GROQ_KE
 main_llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.3, api_key=GROQ_KEY)
 fallback_llm = ChatGroq(model="openai/gpt-oss-20b", temperature=0.3, api_key=GROQ_KEY)
 
-# --- SECURITY: INJECTION BLOCKLIST ---
 INJECTION_PATTERNS = [
     r"ignore\s+(all\s+)?previous\s+instructions",
     r"ignore\s+(all\s+)?above\s+instructions",
@@ -80,6 +79,57 @@ def sanitize_input(text: str) -> tuple[bool, str]:
             return False, f"Blocked: {pattern}"
     return True, ""
 
+# --- LONG-TERM MEMORY HELPERS ---
+def retrieve_memories(query: str, user_id: str, top_k: int = 3) -> str:
+    """Searches past memories for relevant facts about the user."""
+    try:
+        collection = chroma_client.get_collection(name=f"memory_{user_id}")
+        results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=top_k)
+        
+        if results and results['documents'] and results['documents'][0]:
+            memories = results['documents'][0]
+            return "\n".join([f"- {m}" for m in memories])
+    except Exception:
+        pass # No memories exist yet
+    return ""
+
+def save_memory(summary: str, user_id: str):
+    """Saves a conversation summary to long-term memory."""
+    try:
+        collection = chroma_client.get_or_create_collection(name=f"memory_{user_id}")
+        memory_id = str(uuid.uuid4())
+        collection.add(
+            embeddings=embedding_model.encode([summary]).tolist(),
+            documents=[summary],
+            ids=[memory_id]
+        )
+        logger.info(f"🧠 Saved new memory: {summary[:50]}...")
+    except Exception as e:
+        logger.error(f"Failed to save memory: {e}")
+
+async def extract_and_save_memory(history: list, user_id: str):
+    """Summarizes the conversation and saves it to memory."""
+    if len(history) < 4: # Don't save tiny conversations
+        return
+        
+    transcript = "\n".join([f"{m['role']}: {m['content']}" for m in history])
+    prompt = f"""
+    Extract any long-term facts about the user or their project from this conversation.
+    Focus on: Product names, target audiences, tech stack, preferences, and constraints.
+    If there are no lasting facts, reply exactly with "NONE".
+    
+    Conversation:
+    {transcript}
+    """
+    
+    try:
+        response = await fast_llm.ainvoke([HumanMessage(content=prompt)])
+        summary = response.content.strip()
+        if summary and "NONE" not in summary.upper():
+            save_memory(summary, user_id)
+    except Exception as e:
+        logger.error(f"Memory extraction failed: {e}")
+
 # --- 1. DETERMINISTIC PRE-ROUTER ---
 def pre_router(message: str, has_files: bool) -> str:
     msg = message.lower().strip()
@@ -100,9 +150,7 @@ tools = [
             "description": "Search the web for real-time information, market research, competitors, or news.",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "The search query"}
-                },
+                "properties": {"query": {"type": "string"}},
                 "required": ["query"]
             }
         }
@@ -115,7 +163,7 @@ tools = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "The search query"},
+                    "query": {"type": "string"},
                     "file_name": {"type": "string", "description": "Optional: specific file to search"}
                 },
                 "required": ["query"]
@@ -133,46 +181,21 @@ async def execute_web_search(query: str) -> str:
     except Exception as e:
         return f"Web search failed: {e}"
 
-# --- UPGRADE: DOCUMENT SEARCH WITH RERANKING ---
 def execute_search_documents(query: str, user_id: str, session_id: str, file_name: str = None) -> str:
     try:
         collection = chroma_client.get_collection(name=f"docs_{user_id}_{session_id}")
-        
-        # Step 1: Retrieve a larger candidate set (e.g., top 20) from ChromaDB
         if file_name:
-            results = collection.query(
-                query_embeddings=embedding_model.encode([query]).tolist(), 
-                n_results=20, 
-                where={"file_name": file_name}
-            )
+            results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=20, where={"file_name": file_name})
         else:
-            results = collection.query(
-                query_embeddings=embedding_model.encode([query]).tolist(), 
-                n_results=20
-            )
+            results = collection.query(query_embeddings=embedding_model.encode([query]).tolist(), n_results=20)
         
         candidate_chunks = results['documents'][0]
+        if not candidate_chunks: return "No relevant documents found."
         
-        if not candidate_chunks:
-            return "No relevant documents found."
-        
-        # Step 2: Rerank the candidates using the cross-encoder
-        # The reranker scores each (query, chunk) pair jointly for better precision.
-        ranked_results = reranker.rank(
-            query=query, 
-            documents=candidate_chunks, 
-            top_k=5  # Return only the top 5 most relevant chunks
-        )
-        
-        # Step 3: Extract the top chunks and join them
+        ranked_results = reranker.rank(query=query, documents=candidate_chunks, top_k=5)
         top_chunks = [result.document for result in ranked_results]
-        context = "\n\n".join(top_chunks)
-        
-        logger.info(f"Reranked {len(candidate_chunks)} candidates down to {len(top_chunks)} chunks.")
-        return context[:MAX_TOOL_OUTPUT_CHARS]
-        
+        return "\n\n".join(top_chunks)[:MAX_TOOL_OUTPUT_CHARS]
     except Exception as e:
-        logger.error(f"Document search/rerank failed: {e}")
         return f"Document search failed: {e}"
 
 # --- 3. TOKEN-BOUNDED CONTEXT ---
@@ -181,8 +204,7 @@ def estimate_tokens(text: str) -> int:
 
 def compress_history(history: list, max_tokens: int = MAX_CONTEXT_TOKENS) -> list:
     total_tokens = sum(estimate_tokens(m['content']) for m in history)
-    if total_tokens <= max_tokens:
-        return history
+    if total_tokens <= max_tokens: return history
     
     logger.info(f"🗜️ Context too large ({total_tokens} tokens). Compressing...")
     compressed = history[:]
@@ -190,17 +212,22 @@ def compress_history(history: list, max_tokens: int = MAX_CONTEXT_TOKENS) -> lis
         compressed.pop(0)
     return compressed
 
-# --- AGENT LOOP WITH NATIVE TOOL CALLING & STREAMING ---
+# --- AGENT LOOP ---
 async def run_agent_stream(user_message: str, user_id: str, session_id: str, history: list, pre_route: str = "auto"):
     compressed_history = compress_history(history)
     
+    # Inject Long-Term Memories into the System Prompt
+    memories = retrieve_memories(user_message, user_id)
+    memory_context = f"\n\nLONG-TERM MEMORY (Facts about the user):\n{memories}" if memories else ""
+    
     messages = [
-        SystemMessage(content="""You are a helpful, intelligent AI assistant.
+        SystemMessage(content=f"""You are a helpful, intelligent AI assistant.
         Use the provided tools when needed:
         - web_search: for real-time info, news, or competitors
         - search_documents: for questions about the user's uploaded files
         
-        Answer directly when no tools are needed. Be concise but thorough. Use markdown formatting.""")
+        Answer directly when no tools are needed. Be concise. Use markdown.
+        {memory_context}""")
     ]
     
     for msg in compressed_history[-10:]:
@@ -230,9 +257,7 @@ async def run_agent_stream(user_message: str, user_id: str, session_id: str, his
                 accumulated_tool_calls.extend(chunk.tool_calls)
         
         final_ai = AIMessage(content=accumulated_content, tool_calls=accumulated_tool_calls)
-        
-        if not final_ai.tool_calls:
-            return
+        if not final_ai.tool_calls: return
         
         tool_call_count += 1
         messages.append(final_ai)
@@ -240,7 +265,6 @@ async def run_agent_stream(user_message: str, user_id: str, session_id: str, his
         for tool_call in final_ai.tool_calls:
             fn_name = tool_call["name"]
             args = tool_call["args"]
-            
             yield ("step", f"🔧 Running `{fn_name}`...")
             
             if fn_name == "web_search":
@@ -285,14 +309,10 @@ def _extract_text(file_bytes: bytes, file_name: str) -> str:
     return ""
 
 def ingest_files(files, user_id, session_id):
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
-        return "Upload rejected: invalid identity."
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
-        return "Upload rejected: invalid session."
-    if not files or not isinstance(files, list):
-        return "No files received."
-    if len(files) > MAX_FILES:
-        return f"Max {MAX_FILES} files per batch."
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id): return "Invalid identity."
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id): return "Invalid session."
+    if not files or not isinstance(files, list): return "No files."
+    if len(files) > MAX_FILES: return f"Max {MAX_FILES} files."
 
     total_bytes = 0
     all_chunks = []
@@ -300,18 +320,14 @@ def ingest_files(files, user_id, session_id):
     for f in files:
         name = str(f.get("name", ""))[:200]
         safe_name = os.path.basename(name).lower()
-        if not safe_name.endswith(ALLOWED_EXTENSIONS):
-            return f"Unsupported: '{safe_name}'."
+        if not safe_name.endswith(ALLOWED_EXTENSIONS): return f"Unsupported: '{safe_name}'."
         import base64
         try:
             data = base64.b64decode(f.get("data", ""))
-        except Exception:
-            return "Malformed file."
-        if len(data) > MAX_FILE_BYTES:
-            return f"'{safe_name}' exceeds 10 MB."
+        except Exception: return "Malformed file."
+        if len(data) > MAX_FILE_BYTES: return f"'{safe_name}' exceeds 10 MB."
         total_bytes += len(data)
-        if total_bytes > MAX_TOTAL_BYTES:
-            return "Total upload exceeds 25 MB."
+        if total_bytes > MAX_TOTAL_BYTES: return "Total exceeds 25 MB."
         
         text = _extract_text(data, safe_name)
         chunks = [line.strip() for line in text.split('\n') if len(line.strip()) > 40]
@@ -319,8 +335,7 @@ def ingest_files(files, user_id, session_id):
             all_chunks.append(chunk)
             all_metadatas.append({"file_name": safe_name})
 
-    if not all_chunks:
-        return "No readable text found."
+    if not all_chunks: return "No readable text."
 
     embeddings = embedding_model.encode(all_chunks).tolist()
     collection_name = f"docs_{user_id}_{session_id}"
@@ -330,7 +345,7 @@ def ingest_files(files, user_id, session_id):
     collection.add(embeddings=embeddings, documents=all_chunks, metadatas=all_metadatas, ids=[str(i) for i in range(len(all_chunks))])
     return f"Ingested {len(all_chunks)} chunks."
 
-# --- MAIN ENTRY POINT (STREAMING) ---
+# --- MAIN ENTRY POINT ---
 async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="default", deep_dive=False, has_files=False):
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
         yield ("answer", "Invalid user identity.")
@@ -370,7 +385,14 @@ async def ask_agent_v2_stream(user_message, user_id, history=None, session_id="d
         yield ("chunk", f"**Error:** {e}")
         return
     
+    # Save to cache
     if not history:
         query_emb = embedding_model.encode([user_message]).tolist()
         save_to_cache(query_emb, full_response)
         logger.info(f"[{request_id}] Cached.")
+        
+    # EXTRACT & SAVE MEMORY (Run in background so it doesn't slow down the user)
+    asyncio.create_task(extract_and_save_memory(
+        history + [{"role": "user", "content": user_message}, {"role": "assistant", "content": full_response}], 
+        user_id
+    ))
